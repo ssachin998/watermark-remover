@@ -1,72 +1,116 @@
-# QBank Extractor
+# PDF Fixer
 
-Scanned MCQ question banks (PDF) → clean structured JSONL for a DB converter.
-Built for the MARROW ED8 medical series: garbled text layers, figures printed
-above their own stems, solutions in a separate zone from the questions.
+A small Railway-hosted dashboard that cleans garbled medical MCQ PDFs
+(MARROW ED8 series) before any extraction runs.
 
-**Design rule: never guess, never auto-correct.** Every field is either proven
-from the page or flagged for a human. An item that cannot be proven is
-discarded and reported, not shipped as a plausible guess — the output runs to
-18,000+ questions with no capacity to review it.
+**One job, one output: a CLEAN PDF.** The dashboard fixes one thing by
+default, and one thing optionally:
 
-## Pipeline
+1. **Removes the watermark** — generic, works for **any PDF / any repeated
+   watermark**, not just the itachibot series. Pages are kept exactly as
+   uploaded (no re-render, no re-encode), so the output is visually identical
+   and stays near the original file size. Detection covers:
+   - **full-page image families** — the same watermark is often stored as
+     several pixel variants (e.g. 82% + 18% of pages); all full-page variants
+     whose union covers ≥90% of the file are one family and all are removed;
+   - **unique-per-page raster overlays** — some tools bake the watermark
+     into a NEW raster per page (different pixels each page, e.g. xrefs
+     3/5/7/9/… each covering 100% of one page). When full-page images cover
+     ≥98% of pages AND those pages also carry visible vector content AND the
+     images are rotated or light-gray (stamp-like), every full-page image is
+     removed as one watermark family;
+   - **same-position images** repeated on ≥90% of pages covering ≥25% of the
+     page area (diagonal grey banners);
+   - **full-page Form XObjects** repeated on ≥90% of pages (vector-text /
+     painted-band watermarks);
+   - **inline images** (`BI … EI`) repeated across pages;
+   - **watermark text** — known strings ("Sold by", "itachibot",
+     "you purchased", "not for distribution", …) plus any text span repeated
+     on ≥90% of pages that is rotated, large, or known: removed from the
+     content streams and redacted visually. A same-**position** text family
+     (same diagonal region on ≥90% of pages even when the wording differs,
+     e.g. "… - page 123") is redacted at its exact bbox on every page.
+   - **raster-baked watermarks** — when full-page bitmaps cover (almost)
+     every page and nothing else proves a removable object, the watermark is
+     likely burned INTO the pixels. The app builds a per-pixel consensus
+     mask (same normalized pixel is a light-gray overlay on ≥75% of sampled
+     pages), carves out solid gray figures/columns, dark content and margin
+     furniture, then fills those watermark pixels with the page's paper tone
+     and re-encodes the page image as JPEG (no geometry change, no
+     re-render). This also handles slide decks that keep a searchable or
+     invisible-OCR text layer mentioning the watermark ("@HACKEDDOCTOR"),
+     or pages with visible text on top of a background bitmap.
+   Legitimate content is always protected: small corner logos, one-off
+   figures, page numbers and header/footer furniture stay untouched, and an
+   image-only scan with **no provable watermark pattern** is refused with a
+   clear message instead of being damaged.
+2. **OPTIONAL — rebuilds the broken text layer with OCR**
+   (`ocrmypdf --force-ocr`, English + Hindi). **Off by default**: OCR
+   re-renders every page at high DPI, so the file is typically many times
+   larger than the upload, and on low-DPI scans (like 55 DPI iLovePDF
+   outputs) the recognized words are often wrong. Only tick "Rebuild text
+   layer with OCR" if you truly need a searchable layer and accept the size
+   and accuracy trade-off.
 
-```
-TOC                    chapter page ranges, from the book's own contents table
- └─ zones              Q pages / answer-key page / solution pages
-     └─ header index   render + OCR; finds "Question N:" and "Solution to
-                       Question N:" bands
-         └─ crops      one crop per block, header → next header, stitched
-                       across pages as labelled "part i/N" composites
-             ├─ text   PDF text layer first; Gemini for anything not CLEAN
-             ├─ key    answer-key table, read twice, escalates on disagreement
-             └─ images every figure owned by the crop interval it sits inside
-```
+There is **no JSON/QBank/Gemini pipeline** in this app. `fix_pdf.py` does all
+the work; `app.py` is only the upload → progress → download UI.
 
-Text and figures are attributed by the **same** geometry. A figure whose
-(page, y) lies inside a block's interval belongs to that block — including the
-common case where the figure is printed above its stem and the heading sits at
-the bottom of the previous page.
-
-## Running it
+## Run
 
 ```bash
-apt-get install -y poppler-utils tesseract-ocr tzdata
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+apt-get update && apt-get install -y \
+  poppler-utils tesseract-ocr tesseract-ocr-hin ghostscript unpaper
+
+pip install -r requirements.txt
+gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --timeout 0 app:app
 ```
 
-Both `poppler` and `tesseract` are required, not optional.
+or just build the Dockerfile (apt + pip are baked in).
 
-Then `python3 app.py` and use the dashboard, or run a book directly through
-`qbank_pipeline.main()`. Gemini keys come from `GEMINI_API_KEYS` (or
-`GEMINI_API_KEY_1..N`) — each key needs its **own Google project**, since
-quota is enforced per project, not per key.
+## Dashboard
 
-`QBANK_CROP_BATCH` (default 3) controls how many crops share a Gemini call.
-Only text-only, single-page question crops are ever batched; solutions and
-anything with a figure go one-per-call so a neighbour cannot bleed into them.
+- Upload a PDF (max 200 MB)
+- Watermark removal runs automatically. **OCR is a checkbox, unchecked by
+  default** — leave it off to get an upload-like file. If you tick it, you
+  can also pick OCR language, parallel jobs, output type (PDF/A or PDF),
+  deskew/clean
+- Watch the live log; when done, **Download CLEAN PDF** (or preview it,
+  or grab the `step1_no_watermark.pdf` intermediate)
+- Cancel a running job with one click
 
-`QBANK_CROP_DUMP=/some/dir` writes every crop image the model is sent. That is
-the only way to tell a wrong block boundary from a model that invented text.
+Each job is its own `fix_pdf.py` subprocess, so OCR hangs and crashes never
+take the web worker down. Job output is stored in `PDF_FIX_JOBS_DIR`
+(default `/data/pdf_fix_jobs` on the Railway volume).
 
-## Output
+## Env vars
 
-`FORMAT.md` is the converter contract — it is the only file the downstream DB
-project reads, and a copy travels inside every `final_export.zip`.
+| Var | Default | Meaning |
+|---|---|---|
+| `PORT` | `8080` | listen port (set by Railway) |
+| `PDF_FIX_JOBS_DIR` | `/data/pdf_fix_jobs` | job workspace root |
+| `PDF_FIX_MAX_CONCURRENT` | `1` | max parallel OCR jobs (keep 1 on small plans) |
+| `PDF_FIX_MAX_JOB_KEEP` | `20` | job folders kept on disk |
+| `PDF_FIX_MAX_UPLOAD_MB` | `200` | upload size cap |
+| `PDF_FIX_OCR_JOBS` | `1` | default tesseract workers per job (clamped to CPU count) |
+| `PDF_FIX_OUTPUT_TYPE` | `pdfa` | default output type (`pdfa` or `pdf`) |
 
-`REVIEW_LAYER.md` describes the human review layer: the flag queue, in-place
-edits, and the hard-locked final export.
+> **Memory (OCR only):** OCR is RAM-hungry. On 512 MB Railway plans keep
+> `PDF_FIX_MAX_CONCURRENT=1`, `PDF_FIX_OCR_JOBS=1`, leave "Clean" unchecked
+> and use `PDF_FIX_OUTPUT_TYPE=pdf` if you see `exit code -9` (the kernel's
+> out-of-memory kill). The app also sets `OMP_THREAD_LIMIT=1` so every
+> tesseract process uses one thread. The default no-OCR path uses PyMuPDF
+> only and is light on memory.
+
+## CLI (outside the dashboard)
+
+```bash
+python fix_pdf.py /data/input_pdfs/OPH.pdf            # watermark removal only
+python fix_pdf.py OPH.pdf --ocr                       # add OCR text layer
+python fix_pdf.py OPH.pdf --ocr --language eng --jobs 4
+```
 
 ## Verification
 
-```bash
-.venv/bin/python -m pytest -q
-```
-
-Expect 503 passed / 0 failed / 17 skipped with tesseract installed (502 / 1 /
-17 without — the one failure needs tesseract). Two tests are `skipUnless`
-guarded because they need developer-machine fixtures.
-
-`HANDOFF_PROMPT.md` is the current engineering brief: architecture, the
-verified baseline, what is already done, and the open tasks in priority order.
-Read it before changing anything.
+After each upload the dashboard's log shows the step-3 summary:
+pages, OCR engine/language, file size before/after, sample-page quality
+(1/50/100/200/300), watermark-string count (must be 0) and a PASS/FAIL verdict.
