@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PDF Fixer dashboard (Railway).
+PDF Fixer dashboard (Render / Railway / any Docker host).
 
 A tiny Flask app that does exactly one job: clean a garbled medical MCQ PDF
 before any extraction runs.  It uploads a PDF, runs fix_pdf.py in the
@@ -11,6 +11,15 @@ watermark-free intermediate.
 There is no JSON/QBank/Gemini/quota/date code here.  All PDF work lives in
 fix_pdf.py, which runs as a subprocess per job so a hung OCR run can be
 cancelled without touching the web worker.
+
+Platform notes:
+  * The app binds 0.0.0.0 and reads $PORT (Render, Railway, anything).
+  * Job files live in PDF_FIX_JOBS_DIR.  They are only needed WHILE a job
+    runs, so on platforms with an ephemeral filesystem (Render Free) nothing
+    important is lost on restart; old job folders are pruned on startup and
+    after each upload (bounded by PDF_FIX_MAX_JOB_KEEP).
+  * No database, no persistent state: job state is in-memory (one gunicorn
+    worker) and job artifacts are temporary processing files.
 
 Run:
     gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 1 --threads 4 --timeout 0 app:app
@@ -47,6 +56,11 @@ DEFAULT_JOBS = max(1, min(8, int(os.environ.get("PDF_FIX_OCR_JOBS", "1"))))
 OUT_TYPE_DEFAULT = os.environ.get("PDF_FIX_OUTPUT_TYPE", "pdfa")
 if OUT_TYPE_DEFAULT not in ("pdfa", "pdf"):
     OUT_TYPE_DEFAULT = "pdfa"
+# Optional hard cap for a single job (seconds).  0 = no timeout (default -
+# the cancel button is the normal way to stop a job, and large books can
+# legitimately take a long time).  Set e.g. 1800 on small Render Free
+# instances to guarantee a wedged job cannot hold the only worker forever.
+JOB_TIMEOUT = max(0, int(os.environ.get("PDF_FIX_JOB_TIMEOUT", "0")))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -134,6 +148,9 @@ def _spawn(job: dict) -> None:
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # one OpenMP thread per tesseract process - keeps OCR on small 512 MB
+    # instances (Render Free / Railway) away from OOM (documented behavior)
+    env.setdefault("OMP_THREAD_LIMIT", "1")
     log = job["log"]
     _append_log(job, f"$ {' '.join(cmd)}")
 
@@ -180,14 +197,24 @@ def _spawn(job: dict) -> None:
                     job["error"] = (
                         f"fix_pdf.py was killed by signal {-rc} "
                         f"({'-9' if rc == -9 else ''} - almost always "
-                        f"OUT OF MEMORY on small Railway plans). "
+                        f"OUT OF MEMORY on small 512 MB plans). "
                         f"Retry with: Jobs = 1, 'Clean' OFF, Output type = PDF."
                     )
                     _append_log(job, f"ERROR: {job['error']}")
                 else:
                     job["status"] = "error"
-                    job["error"] = (f"fix_pdf.py exited with code {rc}; "
-                                    f"see log for details")
+                    # surface the engine's own error line (e.g. "input PDF is
+                    # password-protected", "input is not a valid PDF",
+                    # "no candidate watermark found") instead of only the code
+                    detail = ""
+                    for ln in reversed(job["log"]):
+                        if ln.lstrip().lower().startswith("error"):
+                            detail = ln.strip()
+                            break
+                    if not detail and job["log"]:
+                        detail = job["log"][-1].strip()
+                    job["error"] = (f"fix_pdf.py exited with code {rc}: "
+                                    f"{detail[:300]}")
                     _append_log(job, f"ERROR: {job['error']}")
             job["finished"] = _now()
         _append_log(job, f"job finished at {time.strftime('%H:%M:%S')}")
@@ -196,10 +223,29 @@ def _spawn(job: dict) -> None:
 
 
 def _dispatcher() -> None:
-    """Start queued jobs respecting MAX_CONCURRENT."""
+    """Start queued jobs respecting MAX_CONCURRENT (and run the optional
+    job-timeout watchdog)."""
     while True:
         to_start = None
         with LOCK:
+            # watchdog: a wedged job must never hold the worker forever
+            # (only active when PDF_FIX_JOB_TIMEOUT > 0)
+            if JOB_TIMEOUT > 0:
+                for jid, job in JOBS.items():
+                    if (job["status"] == "running" and job["started"]
+                            and _now() - job["started"] > JOB_TIMEOUT):
+                        job["status"] = "error"
+                        job["error"] = (f"job exceeded the {JOB_TIMEOUT}s "
+                                        f"timeout (PDF_FIX_JOB_TIMEOUT) and "
+                                        f"was terminated")
+                        job["finished"] = _now()
+                        _append_log(job, f"ERROR: {job['error']}")
+                        proc = PROCS.get(jid)
+                        if proc is not None:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
             running = sum(1 for j in JOBS.values() if j["status"] == "running")
             if running < MAX_CONCURRENT:
                 for jid in ORDER:
@@ -282,6 +328,25 @@ def _jobs_public() -> list[dict]:
 def _get_job(job_id: str) -> dict | None:
     with LOCK:
         return JOBS.get(job_id)
+
+
+# --------------------------------------------------------------------------
+# Startup: prune stale job folders
+# --------------------------------------------------------------------------
+# On Render (ephemeral disk) and after any restart, job folders from
+# previously interrupted/finished runs remain on disk.  They are only
+# temporary processing artifacts, so drop everything beyond MAX_JOB_KEEP at
+# boot.  Safe: the in-memory state starts empty anyway, and pruning only
+# ever removes the OLDEST directories beyond the keep limit.
+def _startup_prune() -> None:
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        prune_old_jobs()
+    except Exception:
+        pass
+
+
+_startup_prune()
 
 
 # --------------------------------------------------------------------------
@@ -599,7 +664,7 @@ PAGE_TEMPLATE = r"""
           <span class="muted">(memory-heavy, off by default)</span></label>
       </div>
       <p class="muted">Tip: default keeps images, figures and file size like
-        your upload. Only when <b>OCR is ON</b>, on small Railway plans use
+        your upload. Only when <b>OCR is ON</b>, on small 512 MB plans use
         <b>Jobs = 1</b>, <b>Clean OFF</b> and <b>Output PDF</b> to avoid
         out-of-memory kills.</p>
       <button class="btn" type="submit">Upload &amp; Fix PDF</button>

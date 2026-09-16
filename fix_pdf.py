@@ -60,10 +60,10 @@ One problem is fixed by default (OCR is an optional extra):
 
 Usage
 -----
-    python3 fix_pdf.py /data/input_pdfs/OPH.pdf          # watermark removal only
-    python3 fix_pdf.py OPH.pdf --ocr                     # add OCR text layer
-    python3 fix_pdf.py OPH.pdf --ocr --language eng      # Hindi pack missing
-    python3 fix_pdf.py OPH.pdf --skip-ocr                # same as default
+    python3 fix_pdf.py input.pdf                         # watermark removal only
+    python3 fix_pdf.py input.pdf --ocr                   # add OCR text layer
+    python3 fix_pdf.py input.pdf --ocr --language eng    # Hindi pack missing
+    python3 fix_pdf.py input.pdf --skip-ocr              # same as default
 
 Output
 ------
@@ -98,7 +98,9 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 PROGRESS_EVERY = 10          # print progress every N pages
-DEFAULT_INPUT = "/data/input_pdfs/OPH.pdf"
+# Input is REQUIRED on the command line (no platform-specific default; the
+# old "/data/input_pdfs/OPH.pdf" was a Railway volume path).
+DEFAULT_INPUT = None
 # Strings that are watermarks in this series (and can appear on any book).
 # Matched case-insensitively against every text payload (content streams AND
 # the extracted text layer), so old "Sold by@itachibot" and new
@@ -132,6 +134,41 @@ READABLE_RE = re.compile(
 
 IMAGE_SUBTYPE = "/Image"
 FORM_SUBTYPE = "/Form"
+
+# --- hidden / invisible watermark text ------------------------------------
+# Text drawn with render mode 3 (invisible) or non-stroking/stroking alpha
+# below this is a "hidden" text object.  Such an object is a watermark when
+# the SAME text recurs on >=90% of the pages (legible invisible OCR layers
+# differ per page and are therefore never matched).
+HIDDEN_ALPHA_MAX = 0.5
+
+# --- vector path watermarks ------------------------------------------------
+# A path (m/l/c/v/y/re + paint op) repeated on >=90% of pages at the same
+# position is a watermark when it is (a) drawn with low fill/stroke alpha
+# (< HIDDEN_ALPHA_MAX) and area >= VECTOR_MIN_AREA, or (b) covers >= 0.25 of
+# the page.  Full-page borders (area > 0.95) and top/bottom margin furniture
+# are excluded (legitimate frames / running heads).
+VECTOR_MIN_AREA = 0.10
+VECTOR_BIG_AREA = 0.25
+VECTOR_FRAME_MAX = 0.95
+
+# --- watermark-associated annotations ---------------------------------------
+# A URI link is removed together with the watermark when its URI contains a
+# watermark needle OR its rect covers >= this fraction of a redacted
+# watermark-text bbox on the same page.  Non-URI links (GoTo, TOC, refs) are
+# NEVER touched.
+LINK_BBOX_IOU_MIN = 0.80
+LINK_NEEDLE_MIN_LEN = 4
+
+# --- Optional Content Groups (PDF layers) -----------------------------------
+# An OCG is removed only when BOTH hold: its /Name contains one of these
+# keywords AND it is OFF by default (a hidden layer).  Visible layers are
+# logged only - their content is handled by the other channels.
+WATERMARK_OCG_KEYWORDS = (
+    "watermark", "itachibot", "hacked", "hackeddoctor", "sold by",
+    "you purchased", "purchased", "not for distribution", "not for sale",
+    "do not share", "do not distribute", "do not copy", "illegal copy",
+)
 
 # --- generic watermark detection thresholds ------------------------------
 # (a) image family: all groups with median min(w,h) coverage >= this whose
@@ -614,6 +651,87 @@ def _string_matches_watermark(raw: bytes, needles: set[str]) -> bool:
     return False
 
 
+def _decode_pdf_text(raw: bytes) -> str | None:
+    """Best-effort decode of a content-stream string payload to text.
+
+    Handles UTF-16BE (leading NUL) and latin-1 (WinAnsi-ish simple fonts).
+    Returns None when the payload is not decodable as text (e.g. binary
+    CID data); callers then simply skip it.
+    """
+    if not raw:
+        return None
+    if raw[0] == 0x00:
+        try:
+            return raw.decode("utf-16-be")
+        except UnicodeDecodeError:
+            return None
+    try:
+        return raw.decode("latin-1")
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _extgstate_alphas(doc, page_xref: int) -> dict[bytes, tuple]:
+    """Resolve /Resources/ExtGState to {name_bytes: (ca_or_None, CA_or_None)}.
+
+    ca = stroking alpha, CA = non-stroking alpha.  A key absent from a state
+    dictionary is None (it does NOT change the current value when the state
+    is selected - correct PDF semantics).
+    """
+    result: dict[bytes, tuple] = {}
+    try:
+        t, v = doc.xref_get_key(page_xref, "Resources/ExtGState")
+    except Exception:
+        return result
+    raw: bytes | None = None
+    if t == "dict":
+        raw = v.encode("latin-1", "replace")
+    elif t == "xref":
+        try:
+            xref = int(v.split()[0])
+            raw = doc.xref_object(xref).encode("latin-1", "replace")
+        except Exception:
+            return result
+    if raw is None:
+        return result
+    for m in re.finditer(rb"/(\w+)\s*<<([^>]*)>>", raw):
+        name, inner = m.group(1), m.group(2)
+        ca = CA = None
+        mca = re.search(rb"/ca\s+([0-9.]+)", inner)
+        mCA = re.search(rb"/CA\s+([0-9.]+)", inner)
+        if mca:
+            try:
+                ca = float(mca.group(1))
+            except ValueError:
+                ca = None
+        if mCA:
+            try:
+                CA = float(mCA.group(1))
+            except ValueError:
+                CA = None
+        result[name] = (ca, CA)
+    return result
+
+
+def _ctm_mul(args: tuple, ctm: tuple) -> tuple:
+    """Compose 'cm' args with the current transformation matrix."""
+    a, b, c, d, e, f = args
+    (A, B, C, D, E, F) = ctm
+    return (
+        a * A + b * C,
+        a * B + b * D,
+        c * A + d * C,
+        c * B + d * D,
+        e * A + f * C + E,
+        e * B + f * D + F,
+    )
+
+
+def _transform_point(ctm: tuple, x: float, y: float) -> tuple[float, float]:
+    a, b, c, d, e, f = ctm
+    return (a * x + c * y + e, b * x + d * y + f)
+
+
 # --------------------------------------------------------------------------
 # PDF dictionary / resource helpers
 # --------------------------------------------------------------------------
@@ -756,6 +874,8 @@ class PatchStats:
     def __init__(self) -> None:
         self.dropped_dos = 0
         self.dropped_text_ops = 0
+        self.hidden_text_ops = 0        # invisible/low-alpha text ops removed
+        self.vector_paths_removed = 0   # repeated watermark path ops removed
         self.dropped_forms = 0
         self.inline_images_removed = 0
         self.forms_patched = 0
@@ -764,6 +884,8 @@ class PatchStats:
         self.redacted_spans = 0
         self.raster_erased = 0          # page images whose pixels were cleaned
         self.unparsed_streams = 0
+        self.watermark_links_removed = 0
+        self.ocgs_removed = 0
 
     def summary(self) -> str:
         return (
@@ -771,6 +893,10 @@ class PatchStats:
             f"{self.dropped_forms} watermark form calls, "
             f"{self.inline_images_removed} inline image(s), "
             f"{self.dropped_text_ops} watermark text ops, "
+            f"{self.hidden_text_ops} hidden text op(s), "
+            f"{self.vector_paths_removed} vector path(s), "
+            f"{self.watermark_links_removed} watermark link(s), "
+            f"{self.ocgs_removed} hidden watermark layer(s), "
             f"neutralized {self.neutralized_images} image object(s), "
             f"{self.redacted_spans} redacted span(s), "
             f"raster-cleaned {self.raster_erased} page image(s), "
@@ -802,6 +928,26 @@ def strip_inline_images(data: bytes, inline_digests: set[str],
     return bytes(out)
 
 
+def _payload_raws(operands: list[tuple], opname: bytes) -> list[bytes]:
+    """Return the string payload(s) of a text-showing op."""
+    if opname in (b"Tj", b"'", b'"'):
+        if operands and operands[-1][0] == "str":
+            return [operands[-1][1]]
+        return []
+    if opname == b"TJ":
+        for tok in reversed(operands):
+            if tok[0] == "group":
+                return [s[1] for s in tok[1] if s[0] == "str"]
+        return []
+    return []
+
+
+def _text_state_hidden(tr: int, ca: float, CA: float) -> bool:
+    """True when the current graphics state renders text invisibly or
+    nearly invisibly (render mode 3 or alpha below the hidden threshold)."""
+    return tr == 3 or ca < HIDDEN_ALPHA_MAX or CA < HIDDEN_ALPHA_MAX
+
+
 def patch_data(
     doc,
     data: bytes,
@@ -811,6 +957,9 @@ def patch_data(
     text_needles: set[str],
     stats: PatchStats,
     forms_done: set[int],
+    hidden_needles: set[str] | None = None,
+    drop_op_indices: set[int] | None = None,
+    extgs: dict[bytes, tuple[float, float]] | None = None,
 ) -> bytes:
     """
     Remove operations from a content stream:
@@ -818,7 +967,13 @@ def patch_data(
       * 'Do' ops invoking a watermark Form XObject; other forms are recursed
         into (they may draw the watermark image);
       * text ops ('Tj', 'TJ', quote, doublequote) whose payload contains a
-        watermark needle.
+        watermark needle;
+      * HIDDEN text ops: invisible (Tr 3) or low-alpha text whose payload is
+        in ``hidden_needles`` (the hidden-watermark channel - ONLY the
+        hidden-state ops are dropped, so an identical visible string is
+        never damaged);
+      * ops whose indices are in ``drop_op_indices`` (repeated vector
+        watermark paths found by the analyzer).
 
     Only operand+operator are dropped; graphics state (q/Q) is never touched,
     so the stream stays balanced.  Returns the new stream (identical bytes when
@@ -835,11 +990,48 @@ def patch_data(
 
     ops = parse_operators(tokens)
     remove_ops: set[int] = set()
+    if drop_op_indices:
+        remove_ops |= drop_op_indices
+        stats.vector_paths_removed += len(drop_op_indices)
     forms_to_patch: set[int] = set()
+
+    # graphics-state tracking for the hidden-text channel (Tr / ca / CA with
+    # a proper q/Q save-restore stack, so a hidden watermark inside a q/Q
+    # block is recognized and the state after Q is correct)
+    hidden_needles = hidden_needles or set()
+    extgs = extgs or {}
+    tr, ca, CA = 0, 1.0, 1.0
+    state_stack: list[tuple[int, float, float]] = []
 
     for idx, (operands, op) in enumerate(ops):
         opname = op[1]
-        if opname == b"Do":
+        if opname == b"q":
+            state_stack.append((tr, ca, CA))
+        elif opname == b"Q":
+            if state_stack:
+                tr, ca, CA = state_stack.pop()
+        elif opname == b"Tr" and operands and operands[-1][0] == "num":
+            try:
+                tr = int(float(operands[-1][1]))
+            except ValueError:
+                tr = 0
+        elif opname in (b"ca", b"CA") and operands and operands[-1][0] == "num":
+            try:
+                v = float(operands[-1][1])
+            except ValueError:
+                v = 1.0
+            if opname == b"ca":
+                ca = v
+            else:
+                CA = v
+        elif opname == b"gs" and operands and operands[-1][0] == "name":
+            st = extgs.get(operands[-1][1])
+            if st is not None:
+                if st[0] is not None:
+                    ca = st[0]
+                if st[1] is not None:
+                    CA = st[1]
+        elif opname == b"Do":
             name = None
             for tok in reversed(operands):
                 if tok[0] == "name":
@@ -854,25 +1046,21 @@ def patch_data(
                         stats.dropped_forms += 1
                 elif xobject_subtype(doc, xref) == FORM_SUBTYPE:
                     forms_to_patch.add(xref)
-        elif opname in (b"Tj", b"'"):
-            if operands and operands[-1][0] == "str":
-                if _string_matches_watermark(operands[-1][1], text_needles):
+        elif opname in (b"Tj", b"'", b'"', b"TJ"):
+            raws = _payload_raws(operands, opname)
+            if not raws:
+                continue
+            # 1) known / visible watermark needles (original behavior)
+            if any(_string_matches_watermark(r, text_needles) for r in raws):
+                remove_ops.add(idx)
+                stats.dropped_text_ops += 1
+            # 2) hidden-watermark needles: ONLY while hidden state is active,
+            #    so a visible identical string is never removed
+            elif hidden_needles and _text_state_hidden(tr, ca, CA):
+                if any(_string_matches_watermark(r, hidden_needles)
+                       for r in raws):
                     remove_ops.add(idx)
-                    stats.dropped_text_ops += 1
-        elif opname == b"TJ":
-            for tok in reversed(operands):
-                if tok[0] == "group":
-                    for sub in tok[1]:
-                        if sub[0] == "str" and _string_matches_watermark(
-                                sub[1], text_needles):
-                            remove_ops.add(idx)
-                            stats.dropped_text_ops += 1
-                    break
-        elif opname == b'"':
-            if operands and operands[-1][0] == "str":
-                if _string_matches_watermark(operands[-1][1], text_needles):
-                    remove_ops.add(idx)
-                    stats.dropped_text_ops += 1
+                    stats.hidden_text_ops += 1
 
     # patch referenced forms first (they may contain the watermark)
     forms_ok = True
@@ -888,7 +1076,9 @@ def patch_data(
             continue
         fx_map = get_xobject_map(doc, fx)
         new, ok = patch_data(doc, old, fx_map, watermark_xrefs,
-                             watermark_forms, text_needles, stats, forms_done)
+                             watermark_forms, text_needles, stats, forms_done,
+                             hidden_needles=hidden_needles,
+                             extgs=_extgstate_alphas(doc, fx))
         if not ok:
             forms_ok = False
         if new != old:
@@ -920,7 +1110,9 @@ def patch_data(
 
 def patch_page(doc, page, watermark_xrefs: set[int], watermark_forms: set[int],
                inline_digests: set[str], text_needles: set[str],
-               stats: PatchStats, forms_done: set[int]) -> bool:
+               stats: PatchStats, forms_done: set[int],
+               hidden_needles: set[str] | None = None,
+               drop_op_indices: set[int] | None = None) -> bool:
     """
     Patch one page's /Contents (and any forms it uses).
 
@@ -934,7 +1126,10 @@ def patch_page(doc, page, watermark_xrefs: set[int], watermark_forms: set[int],
     data = strip_inline_images(data, inline_digests, stats)
     xo_map = get_xobject_map(doc, page.xref)
     new, ok = patch_data(doc, data, xo_map, watermark_xrefs, watermark_forms,
-                         text_needles, stats, forms_done)
+                         text_needles, stats, forms_done,
+                         hidden_needles=hidden_needles,
+                         drop_op_indices=drop_op_indices,
+                         extgs=_extgstate_alphas(doc, page.xref))
     if new != data:
         xref = doc.get_new_xref()
         doc.update_object(xref, "<< /Length 0 >>")
@@ -1107,6 +1302,16 @@ class WatermarkAnalysis:
         self.overlay_family = False
         self.text_bboxes_by_page: dict[int, list[object]] = {}
         self.scan_like = False
+        # hidden/invisible/low-alpha text channel
+        self.hidden_needles: set[str] = set()      # payloads to remove (hidden only)
+        self.hidden_groups: list[tuple[str, set[int]]] = []  # (text, pages)
+        # repeated vector path channel
+        self.vector_drop_ops: dict[int, set[int]] = {}   # page -> op indices
+        self.vector_groups: list[dict] = []              # diagnostics
+        # OCG (PDF layer) report: (name, 'on'|'off', 'removed'|'kept'|'logged')
+        self.ocg_report: list[tuple] = []
+        # human-readable detection report lines
+        self.report: list[str] = []
 
 
 def _group_add(groups: dict, key, group, page_no: int, ratio: float,
@@ -1233,6 +1438,11 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     text_by_key: dict[tuple, TextGroup] = {}
     # (pages, per-page bbox, sample text, area, rotated)
     pos_by_key: dict[tuple, tuple] = {}
+    # hidden (Tr 3 / low alpha) text payloads: page -> {normalized text: [chunks]}
+    hidden_by_page: dict[int, dict[str, list[str]]] = {}
+    # vector path units: {key, page, ops, rect, alpha, area}
+    path_units: list[dict] = []
+    known = set(DEFAULT_WATERMARK_NEEDLES)
 
     for pno, page in enumerate(pages):
         prect = page.rect
@@ -1334,26 +1544,147 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             except ContentParseError:
                 pass
 
-        # ---- visible-content probe (protects pure scans) -----------------
-        # Count visible text ops (render mode != 3, i.e. not invisible OCR
-        # text) and vector path operators.  A page with neither is a plain
-        # raster scan; its full-page image is the CONTENT, not a watermark.
+        # ---- visible-content probe + hidden text + vector path scan ------
+        # One pass over the content stream:
+        #   * visible text/drawings -> protects pure scans (original behavior:
+        #     a page with no visible text ops and no path ops is a plain
+        #     raster scan; its full-page image is the CONTENT, not a watermark)
+        #   * hidden text (render mode 3 or alpha < HIDDEN_ALPHA_MAX) ->
+        #     hidden/invisible watermark channel
+        #   * path units (construction ops + paint op, CTM-transformed bbox)
+        #     -> repeated vector watermark channel
         try:
             toks = tokenize(data)
             ops = parse_operators(toks)
-            tr = 0
-            for operands, op in ops:
+            extgs = _extgstate_alphas(doc, page.xref)
+            tr, ca, CA = 0, 1.0, 1.0
+            state_stack: list[tuple[int, float, float]] = []
+            ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            ctm_stack: list[tuple] = []
+            path_pts: list[tuple[float, float]] = []
+            path_ops: list[int] = []
+            for idx, (operands, op) in enumerate(ops):
                 n = op[1]
-                if n == b"Tr" and operands and operands[-1][0] == "num":
+                if n == b"q":
+                    state_stack.append((tr, ca, CA))
+                    ctm_stack.append(ctm)
+                elif n == b"Q":
+                    if state_stack:
+                        tr, ca, CA = state_stack.pop()
+                    if ctm_stack:
+                        ctm = ctm_stack.pop()
+                elif n == b"cm" and len(operands) == 6:
                     try:
-                        tr = int(operands[-1][1])
+                        ctm = _ctm_mul(tuple(float(t[1]) for t in operands),
+                                       ctm)
+                    except (ValueError, IndexError):
+                        pass
+                elif n == b"Tr" and operands and operands[-1][0] == "num":
+                    try:
+                        tr = int(float(operands[-1][1]))
                     except ValueError:
                         tr = 0
-                elif n in (b"Tj", b"TJ", b"'", b'"') and tr != 3:
+                elif n in (b"ca", b"CA") and operands and operands[-1][0] == "num":
+                    try:
+                        v = float(operands[-1][1])
+                    except ValueError:
+                        v = 1.0
+                    if n == b"ca":
+                        ca = v
+                    else:
+                        CA = v
+                elif n == b"gs" and operands and operands[-1][0] == "name":
+                    st = extgs.get(operands[-1][1])
+                    if st is not None:
+                        if st[0] is not None:
+                            ca = st[0]
+                        if st[1] is not None:
+                            CA = st[1]
+                elif n in (b"Tj", b"TJ", b"'", b'"'):
+                    if tr != 3:
+                        an.visible_content_pages.add(pno)
+                    if (tr == 3 or ca < HIDDEN_ALPHA_MAX
+                            or CA < HIDDEN_ALPHA_MAX):
+                        chunks: list[str] = []
+                        for raw in _payload_raws(operands, n):
+                            s = _decode_pdf_text(raw)
+                            if s:
+                                t = _norm_text(s)
+                                if t:
+                                    chunks.append(t)
+                        if chunks:
+                            joined = " ".join(chunks)
+                            per = hidden_by_page.setdefault(pno, {})
+                            per.setdefault(joined, []).extend(chunks)
+                            for c in chunks:
+                                if c != joined:
+                                    per.setdefault(c, [c])
+                elif n in (b"m", b"l", b"c", b"v", b"y", b"re"):
+                    # path construction: accumulate user-space points
                     an.visible_content_pages.add(pno)
-                elif n in (b"m", b"l", b"c", b"v", b"y", b"re", b"f", b"F",
-                           b"B", b"b", b"S", b"W", b"n"):
+                    path_ops.append(idx)
+                    if n == b"re":
+                        try:
+                            rx, ry, rw, rh = (float(t[1]) for t in operands)
+                            path_pts.extend([(rx, ry), (rx + rw, ry + rh)])
+                        except (ValueError, IndexError):
+                            path_pts, path_ops = [], [idx]
+                    else:
+                        try:
+                            vals = [float(t[1]) for t in operands
+                                    if t[0] == "num"]
+                        except ValueError:
+                            vals = []
+                        if n in (b"m", b"l") and len(vals) >= 2:
+                            path_pts.append((vals[-2], vals[-1]))
+                        elif n in (b"c", b"v", b"y"):
+                            k = 2 if n == b"v" else 3
+                            # control points over-approximate the curve extent
+                            if len(vals) >= 2 * k:
+                                for i in range(-2 * k, 0, 2):
+                                    path_pts.append((vals[i], vals[i + 1]))
+                elif n in (b"f", b"F", b"B", b"b", b"S", b"W", b"n"):
                     an.visible_content_pages.add(pno)
+                    if n != b"n" and path_pts:
+                        xs = [p[0] for p in path_pts]
+                        ys = [p[1] for p in path_pts]
+                        ux0, ux1 = min(xs), max(xs)
+                        uy0, uy1 = min(ys), max(ys)
+                        corners = [
+                            _transform_point(ctm, ux0, uy0),
+                            _transform_point(ctm, ux1, uy0),
+                            _transform_point(ctm, ux0, uy1),
+                            _transform_point(ctm, ux1, uy1),
+                        ]
+                        px0 = min(c[0] for c in corners)
+                        px1 = max(c[0] for c in corners)
+                        py0 = min(c[1] for c in corners)
+                        py1 = max(c[1] for c in corners)
+                        alpha = CA if n in (b"f", b"F", b"B", b"b") else ca
+                        # geometry key: user-space operands quantized by page
+                        # width (identical repeated paths group together even
+                        # when the per-page CTM translation differs)
+                        key_parts: list[int] = []
+                        for i in path_ops:
+                            for t in ops[i][0]:
+                                if t[0] == "num":
+                                    try:
+                                        key_parts.append(int(round(
+                                            float(t[1]) / max(pw, 1e-9) * 1000)))
+                                    except ValueError:
+                                        key_parts.append(0)
+                        key_parts.append(1 if alpha < HIDDEN_ALPHA_MAX else 0)
+                        path_units.append({
+                            "key": tuple(key_parts),
+                            "page": pno,
+                            "ops": list(path_ops) + [idx],
+                            "rect": (px0 / pw, py0 / ph,
+                                     (px1 - px0) / pw, (py1 - py0) / ph),
+                            "alpha": alpha,
+                            "area": max(0.0, (px1 - px0) * (py1 - py0)
+                                        / (pw * ph)),
+                        })
+                    path_pts, path_ops = [], []
         except ContentParseError:
             pass
 
@@ -1541,7 +1872,6 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     # ---- text overlays ---------------------------------------------------
     an.text_groups = list(text_by_key.values())
     an.text_groups.sort(key=lambda g: -len(g.pages))
-    known = set(DEFAULT_WATERMARK_NEEDLES)
     for tg in an.text_groups:
         frac = len(tg.pages) / max(1, an.total_pages)
         known_hit = any(n in tg.needle for n in known)
@@ -1596,6 +1926,95 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
               f"(wording may differ) - redacting exact bboxes")
     # active needle set: detected strings + known defaults (bytes-level scan)
     an.text_needles |= {n for n in known if n and len(n) >= 3}
+
+    # ---- HIDDEN / invisible / low-alpha text family -----------------------
+    # A text payload drawn with render mode 3 (invisible) or alpha below
+    # HIDDEN_ALPHA_MAX that recurs on >=90% of pages (or matches a known
+    # watermark string) is a hidden watermark.  Legitimate invisible OCR
+    # layers differ per page and can never match.  Removal is state-checked
+    # in patch_data: only the hidden-state ops are dropped, so an identical
+    # VISIBLE string elsewhere is never damaged.
+    hidden_text_pages: dict[str, set[int]] = {}
+    hidden_text_chunks: dict[str, set[str]] = {}
+    for pno, per in hidden_by_page.items():
+        for text, chunks in per.items():
+            hidden_text_pages.setdefault(text, set()).add(pno)
+            hidden_text_chunks.setdefault(text, set()).update(chunks)
+    for text, pages in hidden_text_pages.items():
+        frac = len(pages) / max(1, an.total_pages)
+        known_hit = any(k in text for k in known)
+        if frac >= TEXT_MIN_PAGES or known_hit:
+            an.hidden_needles.add(text)
+            for c in hidden_text_chunks[text]:
+                if len(c) >= 4:
+                    an.hidden_needles.add(c)
+            an.hidden_groups.append((text, pages))
+            an.text_detected.add(text)
+    if an.hidden_groups:
+        first, pages0 = an.hidden_groups[0]
+        an.report.append(
+            f"hidden text     : {len(an.hidden_groups)} family(ies), e.g. "
+            f"{first[:40]!r} on {len(pages0)}/{an.total_pages} pages "
+            f"(invisible/low-alpha text repeated across pages)")
+        print(f"[step1] watermark HIDDEN text: {len(an.hidden_groups)} "
+              f"family(ies), e.g. {first[:40]!r} on "
+              f"{len(pages0)}/{an.total_pages} pages (invisible or low alpha)")
+
+    # ---- repeated VECTOR path family ---------------------------------------
+    # Identical path geometry (user-space operands) repeated on >=90% of
+    # pages at the same normalized position is a watermark when it is
+    # low-alpha and area >= VECTOR_MIN_AREA, or opaque with area >=
+    # VECTOR_BIG_AREA.  Full-page frames (area > VECTOR_FRAME_MAX) and
+    # top/bottom margin furniture are excluded.  A repeated object is NOT
+    # automatically a watermark - these thresholds + same-position +
+    # multi-signal checks are the confidence gate.
+    vec_by_key: dict[tuple, dict] = {}
+    for u in path_units:
+        g = vec_by_key.get(u["key"])
+        if g is None:
+            vec_by_key[u["key"]] = {
+                "pages": {u["page"]},
+                "ops": {u["page"]: set(u["ops"])},
+                "rects": [u["rect"]],
+                "areas": [u["area"]],
+                "alpha": u["alpha"],
+            }
+        else:
+            g["pages"].add(u["page"])
+            g["ops"].setdefault(u["page"], set()).update(u["ops"])
+            g["rects"].append(u["rect"])
+            g["areas"].append(u["area"])
+    for g in vec_by_key.values():
+        frac = len(g["pages"]) / max(1, an.total_pages)
+        if frac < SAME_POS_MIN_PAGES:
+            continue
+        base = g["rects"][0]
+        if not all(abs(r[k] - base[k]) <= SAME_POS_TOL
+                   for r in g["rects"] for k in range(4)):
+            continue
+        area = statistics.median(g["areas"])
+        if area < VECTOR_MIN_AREA or area > VECTOR_FRAME_MAX:
+            continue
+        if not (g["alpha"] < HIDDEN_ALPHA_MAX or area >= VECTOR_BIG_AREA):
+            continue
+        nx0, ny0, nw, nh = base
+        if ((ny0 + nh) <= TEXT_MARGIN or ny0 >= 1 - TEXT_MARGIN) \
+                and area < 0.05:
+            continue  # running head / footer line furniture
+        for pno, ops in g["ops"].items():
+            an.vector_drop_ops.setdefault(pno, set()).update(ops)
+        an.vector_groups.append(g)
+    if an.vector_groups:
+        g0 = an.vector_groups[0]
+        an.report.append(
+            f"vector paths    : {len(an.vector_groups)} family(ies), e.g. on "
+            f"{len(g0['pages'])}/{an.total_pages} pages at one position "
+            f"(median area {statistics.median(g0['areas']):.0%}, "
+            f"alpha {g0['alpha']:.2f})")
+        print(f"[step1] watermark VECTOR path(s): {len(an.vector_groups)} "
+              f"family(ies), e.g. on {len(g0['pages'])}/{an.total_pages} "
+              f"pages, median area {statistics.median(g0['areas']):.0%}, "
+              f"alpha {g0['alpha']:.2f} (same position, repeated)")
 
     # union of page coverage across ALL detection channels (report only)
     cov = set(union_pages)
@@ -1875,6 +2294,166 @@ def _erase_one_image(doc, xref, mask, stats) -> bool:
     return True
 
 
+def remove_watermark_links(doc, pages, an: "WatermarkAnalysis",
+                           stats: PatchStats) -> int:
+    """
+    Remove URI link annotations that are clearly associated with the
+    watermark:
+      * the URI contains a detected watermark needle (>= 4 chars), OR
+      * the link rect covers >= LINK_BBOX_IOU_MIN of a redacted
+        watermark-text bbox on the same page.
+
+    Non-URI links (GoTo, TOC, references, navigation) are NEVER touched.
+    Returns the number of removed annotations.
+    """
+    needles = {n for n in an.text_needles if len(n) >= LINK_NEEDLE_MIN_LEN}
+    bboxes = an.text_bboxes_by_page
+    removed = 0
+    link_uri = getattr(fitz, "LINK_URI", 2)
+    for pno, page in enumerate(pages):
+        boxes = bboxes.get(pno)
+        if not boxes and not needles:
+            continue
+        for link in list(page.get_links()):
+            if link.get("kind") != link_uri:
+                continue
+            uri = (link.get("uri") or "").lower()
+            hit = any(n in uri for n in needles)
+            if not hit:
+                try:
+                    fr = fitz.Rect(link.get("from") or (0, 0, 0, 0))
+                except Exception:
+                    continue
+                if not fr.is_empty:
+                    for b in boxes or []:
+                        box = b if isinstance(b, fitz.Rect) else fitz.Rect(b)
+                        if box.is_empty:
+                            continue
+                        inter = fr & box
+                        if not inter.is_empty:
+                            if (inter.width * inter.height) >= \
+                                    LINK_BBOX_IOU_MIN * (fr.width * fr.height):
+                                hit = True
+                                break
+            if hit:
+                try:
+                    page.delete_link(link)
+                    removed += 1
+                except Exception:
+                    pass
+    if removed:
+        stats.watermark_links_removed += removed
+        print(f"[step1] removed {removed} watermark-associated URI link "
+              f"annotation(s); all other links left intact")
+    return removed
+
+
+def inspect_and_trim_ocgs(doc, stats: PatchStats) -> None:
+    """
+    Inspect Optional Content Groups (PDF layers).
+
+    An OCG is removed ONLY when BOTH hold:
+      * its /Name contains a watermark keyword, AND
+      * it is OFF by default (a hidden layer - removing it cannot change
+        anything visible).
+    OCGs that are ON by default are logged only: their drawn content is the
+    responsibility of the other channels (and the layer itself stays so no
+    legitimate layer content is ever dropped).
+    """
+    try:
+        catalog = doc.pdf_catalog()
+        t, v = doc.xref_get_key(catalog, "OCProperties")
+    except Exception:
+        return
+    raw: bytes | None = None
+    if t == "dict":
+        raw = v.encode("latin-1", "replace")
+    elif t == "xref":
+        try:
+            xref = int(v.split()[0])
+            raw = doc.xref_object(xref).encode("latin-1", "replace")
+        except Exception:
+            return
+    if not raw:
+        return
+
+    def _refs(m: "re.Match | None") -> list[int]:
+        if m is None:
+            return []
+        return [int(x) for x in re.findall(rb"(\d+)\s+\d+\s+R", m.group(1))]
+
+    m_ocgs = re.search(rb"/OCGs\s*\[([^\]]*)\]", raw)
+    if not m_ocgs:
+        return
+    ocg_refs = _refs(m_ocgs)
+    if not ocg_refs:
+        return
+    m_d_arr = re.search(rb"/D\s*\[([^\]]*)\]", raw)
+    m_d_dict = re.search(rb"/D\s*<<", raw)
+    if m_d_arr is not None:
+        on_refs = set(_refs(m_d_arr))          # D as array = default-ON list
+        off_refs = set(ocg_refs) - on_refs
+    else:
+        m_on = re.search(rb"/ON\s*\[([^\]]*)\]", raw)
+        m_off = re.search(rb"/OFF\s*\[([^\]]*)\]", raw)
+        if m_on is not None:
+            on_refs = set(_refs(m_on))
+        else:
+            on_refs = set(ocg_refs)            # no /ON -> all on by default
+        off_refs = set(_refs(m_off)) if m_off is not None else \
+            set(ocg_refs) - on_refs
+
+    removed_names: list[str] = []
+    for xref in ocg_refs:
+        name = xref_name_of(doc, xref)
+        if not name:
+            # nameless OCGs can never be confidently tied to a watermark
+            continue
+        low = name.lower()
+        state = "on" if xref in on_refs else "off"
+        is_wm = any(k in low for k in WATERMARK_OCG_KEYWORDS)
+        if is_wm and state == "off":
+            removed_names.append(name)
+        else:
+            doc_tag = "watermark-named" if is_wm else "unrelated"
+            an_report = f"OCG '{name}' ({state} by default, {doc_tag})"
+            print(f"[step1] {an_report} - left untouched")
+    if not removed_names:
+        return
+    keep = [x for x in ocg_refs
+            if xref_name_of(doc, x) not in removed_names]
+    # rewrite the OCG lists without the removed (hidden) watermark OCGs; the
+    # orphaned objects are collected by the garbage=4 save
+    try:
+        doc.xref_set_key(
+            catalog, "OCProperties/OCGs",
+            "[" + " ".join(f"{x} 0 R" for x in keep) + "]")
+        if m_d_dict is not None:
+            off_keep = [x for x in off_refs if x not in ocg_refs
+                        or xref_name_of(doc, x) not in removed_names]
+            doc.xref_set_key(
+                catalog, "OCProperties/D/OFF",
+                "[" + " ".join(f"{x} 0 R" for x in off_keep) + "]")
+        for nm in removed_names:
+            print(f"[step1] removed hidden (off-by-default) watermark OCG "
+                  f"'{nm}'")
+        stats.ocgs_removed += len(removed_names)
+    except Exception as exc:
+        print(f"  [warn] could not trim watermark OCG(s): {exc}",
+              file=sys.stderr)
+
+
+def xref_name_of(doc, xref: int) -> str:
+    """The /Name of an OCG - a PDF name (/Watermark) or literal string."""
+    try:
+        t, v = doc.xref_get_key(xref, "Name")
+        if t in ("name", "string", "text"):
+            return v or ""
+        return ""
+    except Exception:
+        return ""
+
+
 def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStats, list[int]]:
     print("[step1] opening", input_pdf)
     doc = fitz.open(input_pdf)
@@ -1937,7 +2516,8 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
 
     nothing_found = not an.candidates and not an.form_candidates \
         and not an.inline_candidates and not an.text_detected \
-        and not an.text_bboxes_by_page
+        and not an.text_bboxes_by_page and not an.vector_groups \
+        and not an.hidden_groups
     if nothing_found and raster_mask is None:
         if raster_like:
             doc.close()
@@ -1957,8 +2537,9 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
             "no candidate watermark found "
             "(looked for: full-page image families, unique-per-page raster "
             "overlays, same-position repeated images, full-page Form "
-            "XObjects, repeated inline images, repeated/known watermark text "
-            "and same-position text families)."
+            "XObjects, repeated inline images, repeated/known watermark text, "
+            "same-position text families, repeated vector paths and "
+            "invisible/low-alpha repeated text)."
             + hint +
             " Inspect the report above; refusing to proceed so no figure is "
             "damaged."
@@ -1975,6 +2556,32 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
         shown = sorted(an.text_needles, key=len, reverse=True)[:6]
         print(f"[step1] watermark text needle(s): {shown}")
 
+    # detection report lines for the object channels (hidden/vector/text are
+    # appended by the analyzer)
+    if an.candidate_groups:
+        an.report.append(
+            f"image XObjects  : {len(an.candidates)} object(s) in "
+            f"{len(an.candidate_groups)} family(ies) repeated on "
+            f"{'full-page' if an.candidate_groups[0].area_of() >= WATERMARK_COVER_MIN else 'same-position'} "
+            f"coverage on >=90% of pages")
+    if an.overlay_family:
+        an.report.append(
+            "raster overlays : unique-per-page full-page stamp images treated "
+            "as one family (rotated/light-gray, low ink, pages carry vector "
+            "content)")
+    if an.form_candidate_groups:
+        an.report.append(
+            f"Form XObjects   : {len(an.form_candidate_groups)} family(ies) "
+            f"with full-page BBox repeated on >=90% of pages")
+    if an.inline_candidate_groups:
+        an.report.append(
+            f"inline images   : {len(an.inline_candidate_groups)} digest "
+            f"group(s) repeated across pages")
+    if an.text_candidate_groups:
+        an.report.append(
+            f"text overlays   : {len(an.text_candidate_groups)} span family(ies) "
+            f"(repeated/rotated/large/known strings) + exact-bbox redaction")
+
     stats = PatchStats()
     watermark_set = set(an.candidates)
     form_set = set(an.form_candidates)
@@ -1989,11 +2596,15 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
     for pno, page in enumerate(pages):
         # content-stream channels: watermark text ops (and any detected
         # image/form/inline draws - empty set in a pure raster book) are
-        # removed here; harmless on image-only pages.
+        # removed here; harmless on image-only pages.  Hidden-text needles
+        # are state-checked (only invisible/low-alpha ops dropped) and
+        # repeated vector watermark paths are dropped by op index.
         try:
             ok = patch_page(doc, page, watermark_set, form_set,
                             an.inline_candidates, an.text_needles, stats,
-                            forms_done)
+                            forms_done,
+                            hidden_needles=an.hidden_needles,
+                            drop_op_indices=an.vector_drop_ops.get(pno))
             if not ok:
                 dirty.append(pno + 1)
         except Exception as exc:
@@ -2062,15 +2673,35 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
             hits = redact_watermark_text(doc, page, stats, an.text_needles)
             print(f"  [step1] page {pno + 1}: redacted {hits} watermark text span(s)")
 
+    # annotations: watermark-associated URI links go WITH the watermark;
+    # every other link type (GoTo, TOC, refs, navigation) is left intact
+    try:
+        remove_watermark_links(doc, pages, an, stats)
+    except Exception as exc:
+        print(f"  [warn] link cleanup failed: {exc}", file=sys.stderr)
+    # layers: hidden (off-by-default) OCGs named like a watermark are trimmed
+    try:
+        inspect_and_trim_ocgs(doc, stats)
+    except Exception as exc:
+        print(f"  [warn] OCG inspection failed: {exc}", file=sys.stderr)
+
     out_pdf = Path(output_pdf)
     tmp = out_pdf.with_suffix(out_pdf.suffix + ".tmp")
-    doc.save(
-        tmp,
-        garbage=4,      # drop the now-unreferenced watermark objects/xrefs
-        deflate=True,
-        clean=False,
-    )
+    try:
+        doc.save(
+            tmp,
+            garbage=4,      # drop the now-unreferenced watermark objects/xrefs
+            deflate=True,
+            clean=False,
+        )
+    except Exception as exc:
+        doc.close()
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"could not save the cleaned PDF: {exc}")
     doc.close()
+    if not tmp.exists() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("saved cleaned PDF is empty")
     os.replace(tmp, out_pdf)
 
     elapsed = time.time() - t0
@@ -2501,6 +3132,60 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
 
 
 # --------------------------------------------------------------------------
+# before/after comparison (non-destructive guarantee)
+# --------------------------------------------------------------------------
+
+
+def compare_before_after(in_path: Path, out_path: Path) -> dict:
+    """
+    Compare key properties of the input and the cleaned output:
+    page count, page dimensions, image count, link count, annotation count
+    and text length.  Prints the comparison; returns a dict whose 'ok' flag
+    is False when the page COUNT or the page DIMENSIONS changed (those must
+    never change).  Image/link/annotation deltas are EXPECTED when watermark
+    objects were removed and are reported, not treated as failures.
+    """
+    def probe(p: Path) -> dict:
+        d = fitz.open(p)
+        sizes: list[tuple] = []
+        images = links = annots = chars = 0
+        try:
+            page_count = d.page_count
+            for pg in d:
+                sizes.append((round(pg.rect.width, 1),
+                              round(pg.rect.height, 1)))
+                images += len(pg.get_image_info())
+                links += len(pg.get_links())
+                annots += sum(1 for _ in (pg.annots() or []))
+                chars += len(pg.get_text() or "")
+        finally:
+            d.close()
+        return {"pages": page_count, "sizes": sizes, "images": images,
+                "links": links, "annots": annots, "chars": chars}
+
+    a, b = probe(in_path), probe(out_path)
+    pages_ok = a["pages"] == b["pages"]
+    sizes_ok = sorted(a["sizes"]) == sorted(b["sizes"])
+    print("[compare] input -> output:")
+    print(f"  pages             : {a['pages']} -> {b['pages']}"
+          f"  {'(unchanged)' if pages_ok else '(CHANGED!)'}")
+    print(f"  page dimensions   : unchanged" if sizes_ok
+          else f"  page dimensions   : CHANGED! {a['sizes'][:3]}... -> "
+               f"{b['sizes'][:3]}...")
+    print(f"  images (total)    : {a['images']} -> {b['images']}"
+          f"  ({b['images'] - a['images']:+d})")
+    print(f"  links (total)     : {a['links']} -> {b['links']}"
+          f"  ({b['links'] - a['links']:+d})")
+    print(f"  annotations       : {a['annots']} -> {b['annots']}"
+          f"  ({b['annots'] - a['annots']:+d})")
+    print(f"  text chars        : {a['chars']} -> {b['chars']}"
+          f"  ({b['chars'] - a['chars']:+d})")
+    return {"pages_ok": pages_ok, "sizes_ok": sizes_ok,
+            "ok": pages_ok and sizes_ok,
+            "before": a, "after": b}
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -2511,7 +3196,7 @@ def parse_args(argv=None):
                     "layer of a garbled medical MCQ PDF.",
     )
     p.add_argument("input", nargs="?", default=DEFAULT_INPUT,
-                   help=f"input PDF (default {DEFAULT_INPUT})")
+                   help="input PDF (required - no platform-specific default)")
     p.add_argument("--output", default=None,
                    help="explicit output path for the clean PDF "
                         "(default: <input dir>/<stem>_CLEAN.pdf)")
@@ -2572,10 +3257,36 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 3
 
+    if args.input is None:
+        print("error: an input PDF path is required", file=sys.stderr)
+        return 3
     inp = Path(args.input).expanduser().resolve()
     if not inp.exists():
         print(f"error: input PDF not found: {inp}", file=sys.stderr)
         return 3
+
+    # validate the input before any processing: must be openable, and a
+    # user-password-protected file is refused (we never bypass passwords)
+    input_pages = 0
+    try:
+        probe = fitz.open(inp)
+    except Exception as exc:
+        print(f"error: input is not a valid PDF (could not be opened: {exc})",
+              file=sys.stderr)
+        return 3
+    try:
+        input_pages = len(probe)
+        if probe.needs_pass:
+            print("error: input PDF is password-protected; it is refused "
+                  "(passwords are never bypassed). Provide a decrypted copy "
+                  "you are authorized to process.", file=sys.stderr)
+            return 3
+        if probe.is_encrypted:
+            print("[note] input has owner-level permissions (opening with "
+                  "default permissions is allowed) - processing as usual")
+    finally:
+        probe.close()
+
     if args.output:
         out = Path(args.output).expanduser().resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -2603,8 +3314,17 @@ def main(argv=None) -> int:
         return 3
 
     ok1 = True
-    with fitz.open(step1) as chk:
-        ok1 = verify_step1(chk, wm_xrefs, "step1", an.text_needles)
+    try:
+        with fitz.open(step1) as chk:
+            if input_pages and len(chk) != input_pages:
+                print(f"[warn] step1 page count changed: {input_pages} -> "
+                      f"{len(chk)}", file=sys.stderr)
+            ok1 = verify_step1(chk, wm_xrefs, "step1", an.text_needles)
+    except Exception as exc:
+        print(f"error: step1 output is not a readable PDF: {exc}",
+              file=sys.stderr)
+        step1.unlink(missing_ok=True)
+        return 3
     if not ok1:
         print("[warn] step1 verification found residue; see log", file=sys.stderr)
 
@@ -2626,6 +3346,39 @@ def main(argv=None) -> int:
         size_after = out.stat().st_size
         res = verify_output(out, sample_pages, "none (no OCR)", "final",
                             check_quality=False, needles=an.text_needles)
+
+        # hidden-watermark residue check: invisible text is NOT in the
+        # extracted text layer, so verify_output cannot see it - scan the
+        # raw content streams for the hidden needles (warning level only,
+        # the authoritative removal is the state-checked op drop above)
+        if an.hidden_needles:
+            try:
+                with fitz.open(out) as dchk:
+                    for pno, pg in enumerate(dchk):
+                        try:
+                            blob = pg.read_contents().lower()
+                        except Exception:
+                            continue
+                        for needle in an.hidden_needles:
+                            nb = needle.encode("latin-1", "ignore").lower()
+                            if len(nb) >= 4 and nb in blob:
+                                print(f"  [warn] hidden watermark string "
+                                      f"possibly still present on page "
+                                      f"{pno + 1}: {needle[:40]!r}",
+                                      file=sys.stderr)
+            except Exception:
+                pass
+
+        # non-destructiveness proof: compare input vs output
+        cmp = compare_before_after(inp, out)
+        cmp_ok = cmp["ok"]
+        if an.report:
+            print("DETECTION REPORT")
+            for line in an.report:
+                print(f"  {line}")
+        if not cmp_ok:
+            print("[warn] before/after comparison FAILED (page count or "
+                  "dimensions changed) - inspect the output!", file=sys.stderr)
         elapsed = time.time() - t_start
         print("=" * 78)
         print("SUMMARY")
@@ -2638,7 +3391,8 @@ def main(argv=None) -> int:
         print(f"  elapsed                 : {elapsed:.0f}s")
         print(f"  output                  : {out}")
         print(f"  intermediate            : {step1}")
-        verdict = "PASS" if res["ok"] and res["full_watermark_hits"] == 0 else "FAIL"
+        verdict = ("PASS" if res["ok"] and res["full_watermark_hits"] == 0
+                   and cmp_ok else "FAIL")
         print(f"  VERDICT                 : {verdict}")
         print("=" * 78)
         print("Note: no searchable text layer was added (the original broken "

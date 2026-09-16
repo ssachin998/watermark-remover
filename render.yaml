@@ -1,0 +1,19 @@
+# Render blueprint (optional - Render also auto-detects the Dockerfile).
+#
+# Deploy:  New + -> Web Service -> point at this repo -> Build & Release.
+# With this file present, Render pre-fills the settings below; you can also
+# create the service by hand and paste the same values.
+#
+#   Service type    : Web Service
+#   Runtime         : Docker (uses ./Dockerfile)
+#   Plan            : free
+#   Health check    : /health (the app already exposes it)
+#   Environment     : none required (all have safe defaults)
+#   Disk            : not required (job files are temporary processing
+#                     artifacts; see README "Storage behavior")
+services:
+  - type: web
+    name: pdf-fixer
+    runtime: docker
+    plan: free
+    healthCheckPath: /health

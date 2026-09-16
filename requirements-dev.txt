@@ -1,0 +1,4 @@
+# Test-only dependencies (not needed to run the app).
+# Production deps: requirements.txt
+-r requirements.txt
+pytest>=8
