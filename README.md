@@ -26,14 +26,31 @@ default and one thing optionally:
    - **same-position images** repeated on ≥90% of pages covering ≥25% of the
      page area (diagonal grey banners);
    - **full-page Form XObjects** repeated on ≥90% of pages (vector-text /
-     painted-band watermarks);
+     painted-band watermarks) — except forms that look like page templates
+     (they contain text ops or invoke ≥2 other XObjects: borders, footers,
+     rights strips live there and are never removed wholesale). A *small*
+     form drawn at the same page rect on ≥90% of pages overlapping ≥50% of
+     a detected watermark-text region is treated as that stamp's artwork
+     (e.g. a translucent logo nested inside a legitimate template form):
+     only its *invocation* is un-wired, never the template around it;
    - **inline images** (`BI … EI`) repeated across pages;
-   - **watermark text** — known strings ("Sold by", "itachibot", "you
-     purchased", "not for distribution", …) plus any text span repeated on
-     ≥90% of pages that is rotated, large, or known: removed from the
-     content streams and redacted visually. A same-**position** text family
-     (same diagonal region on ≥90% of pages even when the wording differs,
-     e.g. "… - page 123") is redacted at its exact bbox on every page;
+   - **watermark text** — *identity* strings ("itachibot", "hacked
+     doctor" — handles/brand names that never appear in prose) plus any
+     text span repeated on ≥90% of pages that is rotated or large: removed
+     at the content-stream level. *Legal-phrase* strings ("may not be
+     copied", "not for distribution", "you purchased", …) never trigger
+     substring removal — they are also legitimate copyright wording; they
+     only act inside the invisible/low-alpha channel (state-checked) or as
+     whole-line EQUALITY stamps. Visual redaction fallback only touches
+     spans covering ≤12% of the page and never a long prose line (a giant
+     rotated stamp's bbox would otherwise slice through body text — such
+     stamps rely on stream removal; if that fails, the verify verdict says
+     so honestly instead of damaging the page). A same-**position** text
+     family (same region on ≥90% of pages even when wording differs, e.g.
+     "… - page 123") is redacted at its exact bbox — but on documents
+     under 12 pages only when it is rotated, translucent or a known
+     string: on short slide decks, identical repeated wording at one
+     position is the slide title, not a watermark;
    - **invisible / low-alpha text** — text drawn with render mode `3 Tr`
      (invisible) or alpha `< 0.5` that recurs on ≥90% of pages is removed
      **state-checked**: only the hidden-state ops are dropped, so an
@@ -61,6 +78,7 @@ default and one thing optionally:
 
    Legitimate content is always protected: small corner logos, one-off
    figures, tables, page numbers and header/footer furniture stay untouched,
+   repeated slide titles and wrapped copyright paragraphs keep their text,
    and an image-only scan with **no provable watermark pattern** is refused
    with a clear message instead of being damaged. After each job the output
    is compared against the input (page count, page dimensions, images,
@@ -226,9 +244,12 @@ pip install -r requirements-dev.txt   # pytest
 python -m pytest tests/ -q
 ```
 
-23 tests cover the full workflow (upload → process → download via the real
-Flask app + gunicorn), 17 synthetic watermark/legitimacy/security fixtures
-generated at test time, and the graceful-failure cases. Fixtures are built
+24 tests cover the full workflow (upload → process → download via the real
+Flask app + gunicorn), 18 synthetic watermark/legitimacy/security fixtures
+generated at test time (including a regression fixture for a real-world
+small-deck false positive: repeated slide title + wrapped copyright prose +
+rotated translucent stamp + stamp artwork nested inside a page-template
+form), and the graceful-failure cases. Fixtures are built
 with `tests/pdfgen.py` (a minimal raw-PDF writer) so each test controls the
 exact PDF structure it exercises. The suite runs in a clean container
 (baseline: `python:3.13` + `pip install -r requirements.txt
@@ -257,6 +278,9 @@ tooling).
 | Malformed PDFs (garbage, header-only, truncated) | ✅ clear error / graceful repair, never a traceback |
 | Password-protected PDF | ✅ refused with clear message, never bypassed |
 | Watermark-named OCG off by default | ✅ trimmed; visible OCGs & legitimate OCGs kept |
+| Small deck: repeated title + copyright prose containing legal phrases | ✅ all preserved (phrase needles never act on visible prose) |
+| Stamp artwork nested inside a legitimate full-page template form | ✅ art's `Do` un-wired from every caller; template (border, footer, strip) intact |
+| Giant rotated stamp whose bbox covers ~25% of the page | ✅ removed via content-stream ops; no redaction box over body text |
 | Dashboard workflow (upload → poll → download → preview) | ✅ end-to-end incl. concurrent jobs |
 | Health endpoint, invalid-upload rejection | ✅ |
 
@@ -269,8 +293,9 @@ PDFs are unbounded; these paths exist but have only limited coverage):
 - Watermark text using exotic font encodings (broken CMaps) — byte-level
   matching falls back to MuPDF text search + redaction, which can be
   imperfect for heavily encoded fonts.
-- Watermark content inside Form XObjects with unusual nesting, or watermarks
-  expressed only via `BDC/EMC` marked-content sequences.
+- Watermark content inside Form XObjects with deeper/unusual nesting than
+  the tested template-plus-artwork shape, or watermarks expressed only via
+  `BDC/EMC` marked-content sequences.
 - OCG content that is ON by default (visible layer named like a watermark):
   the layer is kept and its content is only removed if the other channels
   independently detect it.

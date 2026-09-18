@@ -50,21 +50,39 @@ def body_line(page_no: int, text: str | None = None,
             + b" Td " + pdf_string(t) + b" Tj ET\n")
 
 
+def extgstate_object(alpha_stroke: float | None = None,
+                     alpha_fill: float | None = None) -> bytes:
+    """An ExtGState dict with CA and/or ca alpha (the portable way to draw
+    translucent content - raw ca/CA keywords are not universally parsed)."""
+    parts = []
+    if alpha_stroke is not None:
+        parts.append(f"/CA {alpha_stroke}")
+    if alpha_fill is not None:
+        parts.append(f"/ca {alpha_fill}")
+    return ("<< /Type /ExtGState " + " ".join(parts) + " >>").encode()
+
+
 def text_show(text: str, x: int, y: int, size: int = 36,
               matrix: str | None = None, invisible: bool = False,
-              alpha: float | None = None) -> bytes:
+              alpha: float | None = None, gs_name: str | None = None) -> bytes:
     """A text-showing op, optionally rotated (matrix), invisible (3 Tr)
-    and/or drawn with non-stroking alpha ``alpha`` (CA)."""
+    and/or drawn with non-stroking alpha ``alpha`` (CA).  With ``gs_name``
+    the alpha comes from an /ExtGState resource instead of the raw operator.
+    """
     s = ""
+    if matrix or gs_name:
+        s += "q\n"
     if matrix:
-        s += f"q {matrix} cm\n"
+        s += f"{matrix} cm\n"
     if alpha is not None:
         s += f"{alpha} CA\n"
+    if gs_name:
+        s += f"/{gs_name} gs\n"
     s += f"BT /F1 {size} Tf {x} {y} Td"
     if invisible:
         s += " 3 Tr"
     s += f" {pdf_string(text).decode('latin-1')} Tj ET\n"
-    if matrix:
+    if gs_name or matrix:
         s += "Q\n"
     return s.encode("latin-1")
 
@@ -75,6 +93,29 @@ def draw_full_image(name: str, mw: int = 612, mh: int = 792) -> bytes:
 
 def draw_rect_image(name: str, x: int, y: int, w: int, h: int) -> bytes:
     return f"q {w} 0 0 {h} {x} {y} cm /{name} Do Q\n".encode()
+
+
+def form_object(stream: bytes, bbox=(0, 0, 612, 792), resources: str = "",
+                inverted_bbox: bool = False) -> bytes:
+    """Form XObject body.  ``inverted_bbox`` reproduces a common real-world
+    quirk: /BBox corner order reversed ([0 792 612 0])."""
+    bb = list(bbox)
+    if inverted_bbox:
+        bb = [bb[0], bb[3], bb[2], bb[1]]
+    bbox_s = "[" + " ".join(str(v) for v in bb) + "]"
+    return (f"<< /Type /XObject /Subtype /Form /BBox {bbox_s} "
+            f"/Resources {resources or '<< >>'} /Length {len(stream)} >>\n"
+            "stream\n").encode() + stream + b"\nendstream"
+
+
+def draw_at(name: str, x: int, y: int, w: int, h: int,
+            alpha: float | None = None,
+            gs_name: str | None = None) -> bytes:
+    """Draw an XObject at (x, y) sized w*h, optionally with transparency
+    (raw ca/CA operators, or via an ExtGState resource ``gs_name``)."""
+    a = f"{alpha} ca {alpha} CA " if alpha is not None else ""
+    gs = f"/{gs_name} gs " if gs_name else ""
+    return f"q {gs}{a}{w} 0 0 {h} {x} {y} cm /{name} Do Q\n".encode()
 
 
 def uri_link_annot(rect, uri: str) -> bytes:

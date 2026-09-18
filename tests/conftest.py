@@ -13,10 +13,11 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 import pdfgen  # noqa: E402
 from pdfgen import (  # noqa: E402
-    body_line, content_figure_jpeg, draw_full_image, draw_rect_image,
-    encrypt_pdf, extra_num, font_object, goto_link_annot, image_object,
-    logo_jpeg, make_pdf, photo_jpeg, smask_object, smask_pair,
-    gray_stamp_jpeg, text_show, uri_link_annot,
+    body_line, content_figure_jpeg, draw_at, draw_full_image,
+    draw_rect_image, encrypt_pdf, extra_num, extgstate_object, font_object,
+    form_object, goto_link_annot, image_object, logo_jpeg, make_pdf,
+    photo_jpeg, smask_object, smask_pair, gray_stamp_jpeg, text_show,
+    uri_link_annot,
 )
 
 FIX = "itachibot"  # known watermark needle used in most fixtures
@@ -260,6 +261,71 @@ def build_all(tmp: Path) -> dict[str, Path]:
         res.append(f"<< /Font << /F1 {fnum} 0 R >> /XObject << /Fig {inum} 0 R >> >>")
     save("watermark_with_figure.pdf", make_pdf(
         streams, res, [font_object(), image_object(fig, 300, 220)]))
+
+    # 18. small slide-deck (the NorcetIQ incident): 4 pages where EVERY
+    #     page repeats the same title line and a long copyright paragraph
+    #     that legitimately contains "may not be copied", plus a rotated
+    #     30%-alpha "@handle wm" stamp whose axis-aligned bbox covers a
+    #     quarter of the page, and stamp ARTWORK drawn as a small nested
+    #     form INSIDE a full-page template form (inverted /BBox).
+    #     Expectations: title/copyright/body lines and the template (border
+    #     + footer text) survive; the stamp text and its artwork go.
+    n = 4
+    fnum = extra_num(n, 0)
+    logox = extra_num(n, 1)
+    tplx = extra_num(n, 2)
+    artx = extra_num(n, 3)
+    gs_stamp = extra_num(n, 4)     # page-level alpha 0.30 for the stamp text
+    gs_art = extra_num(n, 5)       # alpha 0.18 inside the art form
+    title = "Family Health Services-3: General and Geriatric Nursing"
+    # wrapped like a real typeset copyright strip: each line its own Tj,
+    # <=140 chars, and the MIDDLE line contains the 'may not be copied'
+    # phrase - the old engine deleted exactly such lines doc-wide
+    rights_lines = [
+        "All rights are reserved. These notes are the copyright of the "
+        "publisher; reproduction, photocopying, printing, scanning or",
+        "circulating of these notes by any form or by any means, electronic "
+        "or mechanical, may not be copied or shared without written",
+        "permission and will be treated as violation of the Copyright Act. "
+        "Any person involved directly or indirectly will be punishable.",
+    ]
+    art_stream = draw_at("Im0", 0, 0, 370, 290, gs_name="GSa")
+    tpl_stream = (
+        b"0.85 0.15 0.15 RG 3 w 8 8 596 776 re S\n"
+        b"BT /F1 10 Tf 30 24 Td (Nursing Next Live - education) Tj ET\n"
+        b"q 1 0 0 1 120 250 cm /Art Do Q\n")
+    streams, res = [], []
+    for i in range(n):
+        streams.append(
+            b"q 1 0 0 1 0 0 cm /Tpl Do Q\n"
+            + text_show(title, 60, 640, size=20)
+            + text_show(rights_lines[0], 40, 560, size=10)
+            + text_show(rights_lines[1], 40, 546, size=10)
+            + text_show(rights_lines[2], 40, 532, size=10)
+            + body_line(i + 1, f"Nursing care plan step {i + 1} continues "
+                                f"here with important body content.",
+                        x=60, y=470)
+            + body_line(i + 1, f"Line {i + 1} passes through the stamp "
+                               f"region and must survive intact.",
+                        x=60, y=380)
+            + text_show("@handle wm", 0, 0, size=60,
+                        matrix="0.7071 0.7071 -0.7071 0.7071 150 250",
+                        gs_name="GS1"))
+        res.append(f"<< /Font << /F1 {fnum} 0 R >> /ExtGState << /GS1 "
+                   f"{gs_stamp} 0 R >> /XObject << /Tpl {tplx} 0 R >> >>")
+    save("small_deck_nested_stamp.pdf", make_pdf(
+        streams, res, [
+            font_object(),
+            image_object(logo_jpeg(100, 100), 100, 100),
+            form_object(tpl_stream, resources=(
+                f"<< /Font << /F1 {fnum} 0 R >> /XObject << /Art {artx} 0 R "
+                ">> >>"), inverted_bbox=True),
+            form_object(art_stream, bbox=(0, 0, 370, 290), resources=(
+                f"<< /XObject << /Im0 {logox} 0 R >> /ExtGState << /GSa "
+                f"{gs_art} 0 R >> >>")),
+            extgstate_object(0.30, 0.30),
+            extgstate_object(0.18, 0.18),
+        ]))
 
     return out
 

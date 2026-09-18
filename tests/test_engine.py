@@ -1,4 +1,4 @@
-"""Engine tests: run fix_pdf.py as a subprocess (the production path) on 16
+"""Engine tests: run fix_pdf.py as a subprocess (the production path) on
 synthetic fixtures and assert removal + preservation guarantees.
 
 Mapping to the required test list:
@@ -18,6 +18,11 @@ Mapping to the required test list:
   14 scanned/image-based PDF          scan_clean (refused)
   15 malformed/problematic PDF        malformed_* (graceful failure)
   16 password-protected PDF           encrypted (refused, not bypassed)
+  17 OCG layers (extra)                ocgs.pdf (hidden removed / visible kept)
+  18 small-deck false-positive guard   small_deck_nested_stamp.pdf (regression
+     for the real-world 4-page deck incident: repeated slide title, wrapped
+     copyright prose containing 'may not be copied', rotated translucent stamp
+     and stamp artwork nested INSIDE a legitimate template form)
 """
 
 from __future__ import annotations
@@ -288,6 +293,57 @@ def test_17_watermark_layers_handled(fixtures, tmp_path):
 
 
 # ------------------------------------------------- non-destructiveness proof
+# ------------------------------------------------- 18. small-deck incident
+def test_18_small_deck_nested_stamp(fixtures, tmp_path):
+    """Regression for the NorcetIQ incident (4-page study deck that the
+    engine previously mangled): repeated TITLES and a long copyright
+    paragraph containing 'may not be copied' must survive, while a rotated
+    translucent stamp and its artwork - a small Form nested INSIDE a
+    full-page template Form with an inverted /BBox - are removed."""
+    src = fixtures["small_deck_nested_stamp.pdf"]
+    r = run_cli(src, tmp_path)
+    assert r.returncode == 0, r.stderr
+    out = tmp_path / "out.pdf"
+    d_in, d = fitz.open(src), fitz.open(out)
+    try:
+        assert d.page_count == 4
+        tl = " ".join(p.get_text() for p in d).lower()
+        # legitimate content preserved
+        assert "family health services-3" in tl           # repeated title
+        # copyright prose survives - including the wrapped line that
+        # CONTAINS the 'may not be copied' phrase (the incident regression)
+        assert "all rights are reserved" in tl
+        assert "may not be copied" in tl
+        assert "will be punishable" in tl
+        assert "nursing care plan step 3" in tl
+        assert "passes through the stamp region" in tl     # under the stamp
+        assert "nursing next live" in tl                   # template footer
+        w_in = sum(len(p.get_text("words")) for p in d_in)
+        w_out = sum(len(p.get_text("words")) for p in d)
+        assert w_in - w_out == 8, (w_in, w_out)  # only the 2 stamp words/page
+        # watermark removed
+        assert "@handle" not in tl
+        tpl = False
+        for x in range(1, d.xref_length()):
+            try:
+                st = d.xref_stream(x)
+            except Exception:
+                continue
+            if not st:
+                continue
+            if b"/Art Do" in st:
+                raise AssertionError("nested watermark form still drawn")
+            # the template form itself (border path + footer) must remain
+            # (stream is re-serialized op-per-line after the Do removal,
+            # so match tokens, not exact byte spans)
+            if b"Nursing Next Live" in st and b"re" in st and b"776" in st:
+                tpl = True
+        assert tpl, "page template form was destroyed"
+    finally:
+        d_in.close()
+        d.close()
+
+
 def test_compare_before_after_printed(fixtures, tmp_path):
     r = run_cli(fixtures["watermark_with_figure.pdf"], tmp_path)
     assert r.returncode == 0, r.stderr

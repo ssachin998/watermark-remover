@@ -21,14 +21,31 @@ One problem is fixed by default (OCR is an optional extra):
               never removed), all of them are one watermark family;
             * same-position images repeated on >=90% of pages covering >=25%
               of the page area (banners);
-            * full-page Form XObjects repeated on >=90% of pages (vector text
-              / painted-band watermarks);
+            * Form XObjects: a full-page form repeated on >=90% of pages is
+              an overlay watermark ONLY when the form is not a page template
+              (templates carry text ops or >=2 nested draws: borders, footers
+              and rights strips live inside them and are never removed
+              wholesale); additionally a SMALL form drawn at the same page
+              rect on >=90% of pages overlapping >=50% of a detected
+              watermark-text region is that stamp's artwork (e.g. a
+              translucent logo nested inside a legitimate template form) -
+              only its Do invocation is un-wired;
             * inline images (BI...ID...EI) repeated on pages;
-            * known watermark text needles ("Sold by", "itachibot",
-              "you purchased", "not for distribution", ...), any text span
-              repeated on >=90% of pages that is rotated (diagonal), large or
-              known, and same-position text families (wording may differ per
-              page) redacted at their exact bbox.
+            * IDENTITY text needles ("itachibot", "hacked doctor" - handles
+              that never appear in prose): substring removal of matching
+              short ops doc-wide; legal-phrase needles ("may not be copied",
+              "you purchased", "not for distribution", ...) act ONLY inside
+              the state-gated hidden channel - visible prose that merely
+              contains such a phrase is never removed;
+            * any text span repeated on >=90% of pages that is rotated
+              (diagonal), large, or a known string: removed from the content
+              streams; short stamp-sized lines are additionally redacted at
+              their exact bbox, never boxes covering >12% of the page (a
+              giant rotated stamp's bbox would slice body text - stream
+              removal handles those; if it failed, verify reports it);
+              same-position text families (wording may differ per page) are
+              trusted on >=12-page documents or when rotated/translucent, so
+              repeated slide TITLES on short decks survive.
             * raster-baked watermarks: whenever full-page bitmaps cover
               (almost) every page and no other channel proved a removable
               object, the watermark may be burned INTO the pixels - a
@@ -43,8 +60,11 @@ One problem is fixed by default (OCR is an optional extra):
               pattern -> refused untouched.
           Legitimate content is protected: small corner logos, one-off
           figures, page numbers and header/footer furniture stay untouched,
-          and image-only scanned pages without a provable watermark are
-          refused with a clear message (never damaged).
+          copyright paragraphs (including lines containing legal phrases
+          like "may not be copied") keep their wording, template forms
+          (page border/footer frames) keep their draws, and image-only
+          scanned pages without a provable watermark are refused with a
+          clear message (never damaged).
           Intermediate output: step1_no_watermark.pdf
 
   STEP 2  OPTIONAL - rebuild a searchable text layer with OCRmyPDF
@@ -105,10 +125,21 @@ DEFAULT_INPUT = None
 # Matched case-insensitively against every text payload (content streams AND
 # the extracted text layer), so old "Sold by@itachibot" and new
 # "you purchased ..." watermarks are both caught.
+# IDENTITY needles: handles/brand names that never legitimately appear in
+# body prose.  These get document-wide substring treatment (content-stream
+# ops, redaction fallback with the prose guards, link matching, verification).
 DEFAULT_WATERMARK_NEEDLES = [
     "itachibot",
     "hackeddoctor",
     "hacked doctor",
+]
+# PHRASE needles: wording typical of resale watermark stamps, but also
+# perfectly legitimate inside copyright notices ("these notes may not be
+# copied...").  They NEVER trigger substring removal.  A text line only
+# counts as a stamp when it is short (<= MAX_STAMP_PAYLOAD) and repeats on
+# >=90% of pages at the same place, and removal is by WHOLE-PAYLOAD
+# EQUALITY, so prose merely containing the phrase is never touched.
+DEFAULT_STAMP_PHRASES = [
     "sold by",
     "you purchased",
     "you may not",
@@ -191,6 +222,20 @@ SAME_POS_TOL = 0.02          # normalized rect tolerance
 TEXT_MIN_PAGES = 0.90
 TEXT_MIN_AREA = 0.02
 TEXT_MARGIN = 0.08           # top/bottom 8% is "page furniture" zone
+# Small documents (slide decks, short booklets: < this many pages) repeat
+# their TITLES/headers at the same position on every page by design - on
+# those, position/area repetition alone must NEVER classify text as a
+# watermark (huge "redaction" boxes then cut body lines).  Only known
+# watermark strings or rotated/translucent stamps qualify below this size.
+TEXT_STAMP_MIN_DOC = 12
+# A redaction box larger than this share of the page is never applied: it
+# would slice through body content.  Large watermark spans are removed by
+# content-stream op removal instead.
+REDACT_BOX_MAX_FRAC = 0.12
+# Payloads longer than this (normalized chars) are prose, not a stamp line:
+# needle/exact op-removal never deletes them (protects copyright pages that
+# legitimately contain "may not be copied"-style wording).
+MAX_STAMP_PAYLOAD = 140
 # (d) unique-per-page raster overlay family: some tools burn the watermark
 #     into a NEW raster per page (different pixels every page), so no digest
 #     repeats.  When full-page images appear on (almost) every page, the page
@@ -630,6 +675,12 @@ def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
+def _exact_key(s: str) -> str:
+    """Whole-payload equality key: alphanumerics only, lowercase.
+    Tolerates kerning-split TJ arrays and spaces/no-space wording."""
+    return re.sub(r"[^a-z0-9]", "", _norm_text(s))
+
+
 def _needles_hit(text: str, needles: set[str]) -> bool:
     t = _norm_text(text)
     return any(n in t for n in needles)
@@ -671,6 +722,124 @@ def _decode_pdf_text(raw: bytes) -> str | None:
         return None
 
 
+def _xform_rect_pts(r, m):
+    """Corners of rect r under matrix m=(a,b,c,d,e,f); returns fitz.Rect."""
+    a, b, c, d, e, f = m
+    xs = [a * x + c * y + e for x, y in
+          ((r.x0, r.y0), (r.x1, r.y0), (r.x0, r.y1), (r.x1, r.y1))]
+    ys = [b * x + d * y + f for x, y in
+          ((r.x0, r.y0), (r.x1, r.y0), (r.x0, r.y1), (r.x1, r.y1))]
+    return fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+
+
+def _form_stream_uses(doc, xref, cache, data=None):
+    """[(child_name_bytes, ctm_at_Do)] for Do calls in one stream,
+    tracking the q/Q + cm chain (PDF user space, y-up)."""
+    if xref in cache:
+        return cache[xref]
+    uses: list[tuple[bytes, tuple]] = []
+    if data is None:
+        try:
+            data = doc.xref_stream(xref)
+        except Exception:
+            data = None
+    if data:
+        try:
+            ctm = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            cstack: list[tuple] = []
+            for operands, op in parse_operators(tokenize(data)):
+                name = op[1] if isinstance(op, tuple) else op
+                if name == b"q":
+                    cstack.append(ctm)
+                elif name == b"Q":
+                    ctm = cstack.pop() if cstack else ctm
+                elif name == b"cm" and len(operands) >= 6:
+                    try:
+                        args = tuple(float(t[1]) for t in operands[-6:])
+                    except (TypeError, ValueError):
+                        continue
+                    ctm = _ctm_mul(args, ctm)
+                elif name == b"Do":
+                    nm = None
+                    for tok in reversed(operands):
+                        if tok[0] == "name":
+                            nm = tok[1]
+                            break
+                    if nm:
+                        uses.append((nm, ctm))
+        except Exception:
+            pass
+    cache[xref] = uses
+    return uses
+
+
+def _form_drawn_rects(doc, page, cache):
+    """Every Form XObject drawn on `page` (directly or through nesting) as
+    (form_xref, Rect in fitz page space).
+
+    page.get_xobjects() returns the form's RAW /BBox for nested uses (no
+    CTM applied), which is useless for position correlation.  The chain
+    here composes each caller's q/Q+cm transforms with the child's BBox -
+    the practical model MuPDF and this corpus' writers use (form user
+    space == caller space after the Do's CTM; no unit-square rescaling).
+    """
+    out: list[tuple[int, fitz.Rect]] = []
+    pw = float(page.rect.width)
+    ph = float(page.rect.height)
+    visited: set[int] = set()
+    try:
+        page_data = page.read_contents()
+    except Exception:
+        page_data = b""
+
+    def walk(xref, m_in, depth):
+        if depth > 4 or xref in visited:
+            return
+        visited.add(xref)
+        try:
+            res_map = get_xobject_map(doc, xref)
+        except Exception:
+            return
+        for nm, ctm in _form_stream_uses(doc, xref, cache,
+                                         page_data if xref == page.xref
+                                         else None):
+            child = res_map.get(nm)
+            if not child:
+                continue
+            try:
+                if xobject_subtype(doc, child) != FORM_SUBTYPE:
+                    continue
+            except Exception:
+                continue
+            try:
+                bbox = _parse_bbox(doc.xref_get_key(child, "BBox")[1])
+            except Exception:
+                bbox = None
+            if bbox is None or bbox.is_empty or bbox.is_infinite:
+                # no usable /BBox: no reliable position -> do not guess
+                continue
+            m = _ctm_mul(ctm, m_in)
+            r = _xform_rect_pts(bbox, m)      # pdf user space, y-up
+            # clip to the page and convert to fitz space (y-down)
+            r = r & fitz.Rect(0, 0, pw, ph)
+            if r.is_empty or not r.is_valid:
+                continue
+            out.append((child,
+                        fitz.Rect(r.x0, ph - r.y1, r.x1, ph - r.y0)))
+            walk(child, m, depth + 1)
+        visited.discard(xref)
+
+    walk(page.xref, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), 0)
+    # one rect per form per page (the biggest use) - multiple uses would
+    # break the same-position family test
+    best: dict[int, fitz.Rect] = {}
+    for fx, r in out:
+        cur = best.get(fx)
+        if cur is None or (r.width * r.height) > (cur.width * cur.height):
+            best[fx] = r
+    return list(best.items())
+
+
 def _extgstate_alphas(doc, page_xref: int) -> dict[bytes, tuple]:
     """Resolve /Resources/ExtGState to {name_bytes: (ca_or_None, CA_or_None)}.
 
@@ -694,8 +863,24 @@ def _extgstate_alphas(doc, page_xref: int) -> dict[bytes, tuple]:
             return result
     if raw is None:
         return result
-    for m in re.finditer(rb"/(\w+)\s*<<([^>]*)>>", raw):
+    for m in re.finditer(rb"/(\w+)\s*(?:<<([^>]*)>>|(\d+)\s+0\s+R)",
+                         raw):
         name, inner = m.group(1), m.group(2)
+        if inner is None and m.group(3):
+            # indirect state dict: /GS0 7 0 R  (the common writer style)
+            try:
+                obj = doc.xref_object(int(m.group(3)),
+                                      compressed=True) or ""
+                obj = obj.strip()
+                if obj.startswith("<<"):
+                    obj = obj[2:]
+                if obj.endswith(">>"):
+                    obj = obj[:-2]
+                inner = obj.encode("latin-1", "replace")
+            except Exception:
+                continue
+        if inner is None:
+            continue
         ca = CA = None
         mca = re.search(rb"/ca\s+([0-9.]+)", inner)
         mCA = re.search(rb"/CA\s+([0-9.]+)", inner)
@@ -960,6 +1145,7 @@ def patch_data(
     hidden_needles: set[str] | None = None,
     drop_op_indices: set[int] | None = None,
     extgs: dict[bytes, tuple[float, float]] | None = None,
+    text_exact: set[str] | None = None,
 ) -> bytes:
     """
     Remove operations from a content stream:
@@ -999,6 +1185,7 @@ def patch_data(
     # a proper q/Q save-restore stack, so a hidden watermark inside a q/Q
     # block is recognized and the state after Q is correct)
     hidden_needles = hidden_needles or set()
+    text_exact = text_exact or set()
     extgs = extgs or {}
     tr, ca, CA = 0, 1.0, 1.0
     state_stack: list[tuple[int, float, float]] = []
@@ -1050,11 +1237,27 @@ def patch_data(
             raws = _payload_raws(operands, opname)
             if not raws:
                 continue
-            # 1) known / visible watermark needles (original behavior)
-            if any(_string_matches_watermark(r, text_needles) for r in raws):
+            # A watermark stamp is a SHORT payload.  Long payloads are
+            # prose (titles, copyright paragraphs) - removing them because
+            # they merely CONTAIN a needle string is what mangled a real
+            # user's deck, so needle/exact matching refuses long payloads.
+            joined = _norm_text("".join(
+                _decode_pdf_text(r) or "" for r in raws))
+            stamp_like = len(joined) <= MAX_STAMP_PAYLOAD
+            # 1) known / visible watermark needles (short payloads only)
+            if stamp_like and any(
+                    _string_matches_watermark(r, text_needles)
+                    for r in raws):
                 remove_ops.add(idx)
                 stats.dropped_text_ops += 1
-            # 2) hidden-watermark needles: ONLY while hidden state is active,
+            # 2) EQUALITY with a detected watermark string (never a
+            #    substring match - a title may legitimately repeat the
+            #    watermark's wording)
+            elif stamp_like and text_exact and joined:
+                if _exact_key(joined) in text_exact:
+                    remove_ops.add(idx)
+                    stats.dropped_text_ops += 1
+            # 3) hidden-watermark needles: ONLY while hidden state is active,
             #    so a visible identical string is never removed
             elif hidden_needles and _text_state_hidden(tr, ca, CA):
                 if any(_string_matches_watermark(r, hidden_needles)
@@ -1078,7 +1281,8 @@ def patch_data(
         new, ok = patch_data(doc, old, fx_map, watermark_xrefs,
                              watermark_forms, text_needles, stats, forms_done,
                              hidden_needles=hidden_needles,
-                             extgs=_extgstate_alphas(doc, fx))
+                             extgs=_extgstate_alphas(doc, fx),
+                             text_exact=text_exact)
         if not ok:
             forms_ok = False
         if new != old:
@@ -1112,7 +1316,8 @@ def patch_page(doc, page, watermark_xrefs: set[int], watermark_forms: set[int],
                inline_digests: set[str], text_needles: set[str],
                stats: PatchStats, forms_done: set[int],
                hidden_needles: set[str] | None = None,
-               drop_op_indices: set[int] | None = None) -> bool:
+               drop_op_indices: set[int] | None = None,
+               text_exact: set[str] | None = None) -> bool:
     """
     Patch one page's /Contents (and any forms it uses).
 
@@ -1129,7 +1334,8 @@ def patch_page(doc, page, watermark_xrefs: set[int], watermark_forms: set[int],
                          text_needles, stats, forms_done,
                          hidden_needles=hidden_needles,
                          drop_op_indices=drop_op_indices,
-                         extgs=_extgstate_alphas(doc, page.xref))
+                         extgs=_extgstate_alphas(doc, page.xref),
+                         text_exact=text_exact)
     if new != data:
         xref = doc.get_new_xref()
         doc.update_object(xref, "<< /Length 0 >>")
@@ -1155,6 +1361,17 @@ def neutralize_image_object(doc, page, xref: int, stats: PatchStats) -> None:
               file=sys.stderr)
 
 
+def _inside_protected(r: fitz.Rect, protected: list) -> bool:
+    """True when the rect's center falls inside a protected prose line."""
+    if not protected:
+        return False
+    try:
+        pt = fitz.Point((r.x0 + r.x1) / 2.0, (r.y0 + r.y1) / 2.0)
+    except Exception:
+        return True
+    return any(p.contains(pt) for p in protected)
+
+
 def redact_watermark_text(doc, page, stats: PatchStats,
                           needles: set[str]) -> int:
     """
@@ -1165,20 +1382,43 @@ def redact_watermark_text(doc, page, stats: PatchStats,
     images and line art are preserved).
     """
     rects: list[fitz.Rect] = []
+    protected: list[fitz.Rect] = []   # long prose lines - never redact inside
     # 1) rawdict spans (precise per-span rects)
     try:
         raw = page.get_text("rawdict")
+        parea = max(1.0, page.rect.width * page.rect.height)
         for block in raw.get("blocks", []):
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
+                line_text = "".join(
+                    "".join(ch.get("c", "") for ch in sp.get("chars", []))
+                    for sp in line.get("spans", []))
+                # a long LINE is prose (or a dense vertical copyright
+                # strip): legal paragraphs legitimately contain "may not
+                # be copied"-style wording, and redacting inside such a
+                # line would gut real content.  Watermark stamps are short
+                # individual lines, so length alone separates them.
+                if len(_norm_text(line_text)) > MAX_STAMP_PAYLOAD:
+                    protected.append(fitz.Rect(line["bbox"]))
+                    continue
                 for span in line.get("spans", []):
                     span_text = "".join(
                         ch.get("c", "") for ch in span.get("chars", []))
                     if _needles_hit(span_text, needles):
-                        rects.append(fitz.Rect(span["bbox"]))
+                        r = fitz.Rect(span["bbox"])
+                        # A span whose axis-aligned bbox covers a large part
+                        # of the page (giant rotated stamp) must NEVER be
+                        # redacted: the rect slices through body text that
+                        # happens to fall inside it.  Op removal handles
+                        # those; if it failed, the verify step reports the
+                        # leftover honestly instead of mangling the page.
+                        if r.width * r.height > REDACT_BOX_MAX_FRAC * parea:
+                            continue
+                        rects.append(r)
     except Exception:
         rects = []
+        protected = []
     # 2) MuPDF text search - works even when rawdict spans are empty.
     # Longest needle first, so "Sold by@itachibot" wins over its substrings
     # and the "@" between them is covered (no visual leftovers).
@@ -1190,6 +1430,8 @@ def redact_watermark_text(doc, page, stats: PatchStats,
                 try:
                     for r in page.search_for(needle):
                         r = fitz.Rect(r)
+                        if _inside_protected(r, protected):
+                            continue
                         if not any(r.intersects(x) for x in rects):
                             rects.append(r)
                 except Exception:
@@ -1201,7 +1443,10 @@ def redact_watermark_text(doc, page, stats: PatchStats,
         try:
             for w in page.get_text("words"):
                 if _needles_hit(w[4], needles):
-                    rects.append(fitz.Rect(w[:4]))
+                    r = fitz.Rect(w[:4])
+                    if _inside_protected(r, protected):
+                        continue
+                    rects.append(r)
         except Exception:
             pass
 
@@ -1236,6 +1481,7 @@ class WatermarkGroup:
         self.areas: list[float] = []       # bbox area / page area
         self.rects: list[tuple] = []       # normalized bbox per page
         self.rotated_draws = 0             # draws with a rotated CTM
+        self.template = False              # form carries text/>=2 XObjects
         self.width = width
         self.height = height
 
@@ -1304,6 +1550,7 @@ class WatermarkAnalysis:
         self.scan_like = False
         # hidden/invisible/low-alpha text channel
         self.hidden_needles: set[str] = set()      # payloads to remove (hidden only)
+        self.text_exact: set[str] = set()   # whole-payload EQUALITY removals
         self.hidden_groups: list[tuple[str, set[int]]] = []  # (text, pages)
         # repeated vector path channel
         self.vector_drop_ops: dict[int, set[int]] = {}   # page -> op indices
@@ -1435,6 +1682,8 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     groups_by_digest: dict[bytes, WatermarkGroup] = {}
     inline_by_digest: dict[bytes, WatermarkGroup] = {}
     form_by_digest: dict[bytes, WatermarkGroup] = {}
+    form_stats: dict[bytes, tuple] = {}   # digest -> (has_text, n_do)
+    form_ctm_cache: dict[int, list] = {}  # xref -> [(child_name, ctm)]
     text_by_key: dict[tuple, TextGroup] = {}
     # (pages, per-page bbox, sample text, area, rotated)
     pos_by_key: dict[tuple, tuple] = {}
@@ -1443,6 +1692,9 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     # vector path units: {key, page, ops, rect, alpha, area}
     path_units: list[dict] = []
     known = set(DEFAULT_WATERMARK_NEEDLES)
+    # phrase needles participate ONLY in the (state-gated) hidden
+    # channel - never in substring/exact removal of visible prose
+    hidden_known = known | set(DEFAULT_STAMP_PHRASES)
 
     for pno, page in enumerate(pages):
         prect = page.rect
@@ -1502,30 +1754,42 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                     an.fullpage_rotated += 1
                     g.rotated_draws += 1
 
-        # ---- Form XObjects (digest of the form stream) ------------------
-        xo_map = get_xobject_map(doc, page.xref)
-        for name, fx in xo_map.items():
+        # ---- Form XObjects (top-level AND nested; digest of the stream) --
+        # drawn rects come from the CTM-chain walker (get_xobjects() gives
+        # raw BBoxes for nested uses, useless for correlation)
+        try:
+            form_uses = _form_drawn_rects(doc, page, form_ctm_cache)
+        except Exception:
+            form_uses = []
+        for fx, frect in form_uses:
             try:
-                if xobject_subtype(doc, fx) != FORM_SUBTYPE:
-                    continue
                 stream = doc.xref_stream(fx)
-                fdigest = __import__("hashlib").sha256(stream).digest()
-                fkey = b"form:" + fdigest
-                bbox_v = doc.xref_get_key(fx, "BBox")[1]
-                bbox = _parse_bbox(bbox_v)
-                if bbox is None or bbox.is_empty or bbox.is_infinite:
-                    continue
-                wr = min(1.0, bbox.width / pw)
-                hr = min(1.0, bbox.height / ph)
-                ratio = min(wr, hr)
-                fg = WatermarkGroup(fkey, fx, int(bbox.width),
-                                    int(bbox.height))
-                _group_add(form_by_digest, fkey, fg, pno, ratio,
-                           (bbox.width * bbox.height) / (pw * ph),
-                           (bbox.x0 / pw, bbox.y0 / ph, bbox.width / pw,
-                            bbox.height / ph))
             except Exception:
                 continue
+            if not stream:
+                continue
+            fdigest = __import__("hashlib").sha256(stream).digest()
+            fkey = b"form:" + fdigest
+            stats = form_stats.get(fdigest)
+            if stats is None:
+                has_text = (b"BT" in stream and (b"Tj" in stream
+                                                 or b"TJ" in stream))
+                n_do = len(re.findall(rb"/[^\s<>\[\]/()]+ +Do\b", stream))
+                stats = (has_text, n_do)
+                form_stats[fdigest] = stats
+            tx0 = max(0.0, float(frect.x0))
+            ty0 = max(0.0, float(frect.y0))
+            tx1 = min(pw, float(frect.x1))
+            ty1 = min(ph, float(frect.y1))
+            if tx1 <= tx0 or ty1 <= ty0:
+                continue
+            wr = (tx1 - tx0) / pw
+            hr = (ty1 - ty0) / ph
+            ratio = min(wr, hr)
+            fg = WatermarkGroup(fkey, fx, int(tx1 - tx0), int(ty1 - ty0))
+            fg.template = stats[0] or stats[1] >= 2
+            _group_add(form_by_digest, fkey, fg, pno, ratio, wr * hr,
+                       (tx0 / pw, ty0 / ph, wr, hr))
 
         # ---- inline images ----------------------------------------------
         try:
@@ -1846,15 +2110,10 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     an.candidates = sorted(set(an.candidates))
 
     # ---- forms -----------------------------------------------------------
+    # (selection happens after the text channels: the small-overlay rule
+    # correlates stamp artwork with detected watermark text families)
     an.form_groups = list(form_by_digest.values())
     an.form_groups.sort(key=lambda g: -len(g.pages))
-    an.form_candidate_groups = [
-        g for g in an.form_groups
-        if cover_of(g) >= WATERMARK_COVER_MIN
-        and len(g.pages) / max(1, an.total_pages) >= WATERMARK_FREQ_MIN
-    ]
-    for g in an.form_candidate_groups:
-        an.form_candidates |= g.xrefs
 
     # ---- inline images ---------------------------------------------------
     an.inline_groups = list(inline_by_digest.values())
@@ -1887,10 +2146,20 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                       or tg.rect[1] >= 1 - TEXT_MARGIN) and tg.area < TEXT_MIN_AREA
         if margin_hit and not known_hit:
             continue
-        if known_hit or tg.rotated or tg.area >= TEXT_MIN_AREA:
-            an.text_candidate_groups.append(tg)
+        if not (known_hit or tg.rotated):
+            # neither known nor rotated: only trusted on LONG documents where
+            # body content does not repeat at identical positions
+            if an.total_pages < TEXT_STAMP_MIN_DOC or tg.area < TEXT_MIN_AREA:
+                continue
+        an.text_candidate_groups.append(tg)
+        if known_hit:
             an.text_needles.add(tg.needle)
-            an.text_detected.add(tg.needle)
+        else:
+            # detected-but-unknown string: remove ONLY ops whose whole
+            # payload equals it (a title/heading merely CONTAINING the same
+            # words is never touched)
+            an.text_exact.add(_exact_key(tg.needle))
+        an.text_detected.add(tg.needle)
     if an.text_candidate_groups:
         print(f"[step1] watermark TEXT overlay(s): {len(an.text_candidate_groups)} "
               f"repeated span(s) on {an.total_pages}-page book, e.g. "
@@ -1907,15 +2176,28 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
         known_hit = any(n in sample for n in known)
         if frac < TEXT_MIN_PAGES and not known_hit:
             continue
+        if not (known_hit or rot_sig or rotated):
+            # plain same-position repeats: on small docs these are slide
+            # titles / template headings, NOT watermarks (this exact
+            # misclassification cut body lines mid-word on a 4-page deck)
+            if an.total_pages < TEXT_STAMP_MIN_DOC:
+                continue
         nx0, ny0, nw, nh = nrect
         margin_hit = ((ny0 + nh) <= TEXT_MARGIN or ny0 >= 1 - TEXT_MARGIN) \
             and area < TEXT_MIN_AREA
         if margin_hit and not (rot_sig or rotated) and not known_hit:
             continue
         if known_hit or rot_sig or rotated or area >= TEXT_MIN_AREA:
-            for pno, b in boxes.items():
-                an.text_bboxes_by_page.setdefault(pno, []).append(b)
-            an.text_needles.add(sample)
+            if area <= REDACT_BOX_MAX_FRAC:
+                for pno, b in boxes.items():
+                    an.text_bboxes_by_page.setdefault(pno, []).append(b)
+            # even when redaction boxes were too big to apply, the text is
+            # still removed via op removal; the family rect also feeds the
+            # nested-form correlation below
+            if known_hit:
+                an.text_needles.add(sample)
+            else:
+                an.text_exact.add(_exact_key(sample))
             an.text_detected.add(sample)
             an.text_candidate_groups.append(
                 TextGroup(sample, nrect, rot_sig or rotated, area,
@@ -1942,7 +2224,9 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             hidden_text_chunks.setdefault(text, set()).update(chunks)
     for text, pages in hidden_text_pages.items():
         frac = len(pages) / max(1, an.total_pages)
-        known_hit = any(k in text for k in known)
+        # phrases are OK HERE: hidden removal only ever drops ops painted
+        # while the invisible/translucent state is active, never body prose
+        known_hit = any(k in text for k in hidden_known)
         if frac >= TEXT_MIN_PAGES or known_hit:
             an.hidden_needles.add(text)
             for c in hidden_text_chunks[text]:
@@ -1959,6 +2243,40 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
         print(f"[step1] watermark HIDDEN text: {len(an.hidden_groups)} "
               f"family(ies), e.g. {first[:40]!r} on "
               f"{len(pages0)}/{an.total_pages} pages (invisible or low alpha)")
+
+    # ---- forms: selection (needs the text channels above) ----------------
+    # 1) a form drawn (near) full-page on (nearly) every page with NO text
+    #    ops and <2 XObject uses is an overlay (classic single-stamp form);
+    #    a form carrying text or several images is a page TEMPLATE frame and
+    #    must never be removed wholesale (that mistake deleted borders,
+    #    footers and copyright strips on a 4-page deck).
+    # 2) a small form repeated at the SAME page rect on every page, whose
+    #    area overlaps >=50% with a detected watermark text family, is the
+    #    artwork of that same stamp (e.g. a nested translucent logo drawn
+    #    inside a legitimate template form) -> its Do call is removed from
+    #    its callers, not the template itself.
+    stamp_rects = [g.rect for g in an.text_candidate_groups]
+    for g in an.form_groups:
+        freq = len(g.pages) / max(1, an.total_pages)
+        if freq < WATERMARK_FREQ_MIN or g.template:
+            continue
+        if cover_of(g) >= WATERMARK_COVER_MIN:
+            an.form_candidate_groups.append(g)
+            continue
+        if not (0.05 <= g.area_of() <= 0.85) or not g.same_rect():
+            continue
+        fx0, fy0, fw, fh = g.rects[0]
+        fa = fw * fh
+        if fa <= 0:
+            continue
+        for (sx0, sy0, sw, sh) in stamp_rects:
+            ix = max(0.0, min(fx0 + fw, sx0 + sw) - max(fx0, sx0))
+            iy = max(0.0, min(fy0 + fh, sy0 + sh) - max(fy0, sy0))
+            if ix * iy / fa >= 0.5:
+                an.form_candidate_groups.append(g)
+                break
+    for g in an.form_candidate_groups:
+        an.form_candidates |= g.xrefs
 
     # ---- repeated VECTOR path family ---------------------------------------
     # Identical path geometry (user-space operands) repeated on >=90% of
@@ -2031,13 +2349,17 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
 
 
 def _parse_bbox(value: str):
-    """Parse a PDF /BBox value ('[0 0 612 792]' or an indirect ref)."""
+    """Parse a PDF /BBox value ('[0 0 612 792]', possibly with swapped
+    corners like '[0 792 612 0]', or an indirect ref).  Returns a NORMALIZED
+    (non-inverted) rect, or None."""
     try:
-        import ast
         vals = re.findall(r"-?[\d.]+", value or "")
         if len(vals) == 4:
-            return fitz.Rect(float(vals[0]), float(vals[1]),
-                             float(vals[2]), float(vals[3]))
+            x0, y0, x1, y1 = (float(v) for v in vals)
+            r = fitz.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            if r.is_empty or r.is_infinite:
+                return None
+            return r
     except Exception:
         return None
     return None
@@ -2306,7 +2628,12 @@ def remove_watermark_links(doc, pages, an: "WatermarkAnalysis",
     Non-URI links (GoTo, TOC, references, navigation) are NEVER touched.
     Returns the number of removed annotations.
     """
-    needles = {n for n in an.text_needles if len(n) >= LINK_NEEDLE_MIN_LEN}
+    needles = {n for n in (an.text_needles | an.hidden_needles)
+               if len(n) >= LINK_NEEDLE_MIN_LEN}
+    # equality-key set (squashed): catches handles like '@norcetiq' whose
+    # '@' never appears verbatim inside a URI such as t.me/NorcetIQ
+    exact = {e for e in an.text_exact | an.hidden_needles
+             if len(e) >= LINK_NEEDLE_MIN_LEN}
     bboxes = an.text_bboxes_by_page
     removed = 0
     link_uri = getattr(fitz, "LINK_URI", 2)
@@ -2318,7 +2645,12 @@ def remove_watermark_links(doc, pages, an: "WatermarkAnalysis",
             if link.get("kind") != link_uri:
                 continue
             uri = (link.get("uri") or "").lower()
-            hit = any(n in uri for n in needles)
+            uri_x = _exact_key(uri)
+            # '@'-handles rarely appear verbatim in URIs (t.me/NorcetIQ), so
+            # also compare in the squashed alphanumeric form
+            hit = any(n in uri for n in needles) or \
+                any(e in uri_x for e in exact) or \
+                any(_exact_key(n) in uri_x for n in needles if len(n) >= 5)
             if not hit:
                 try:
                     fr = fitz.Rect(link.get("from") or (0, 0, 0, 0))
@@ -2604,7 +2936,8 @@ def remove_watermark(input_pdf: Path, output_pdf: Path, args) -> tuple[PatchStat
                             an.inline_candidates, an.text_needles, stats,
                             forms_done,
                             hidden_needles=an.hidden_needles,
-                            drop_op_indices=an.vector_drop_ops.get(pno))
+                            drop_op_indices=an.vector_drop_ops.get(pno),
+                            text_exact=an.text_exact)
             if not ok:
                 dirty.append(pno + 1)
         except Exception as exc:
@@ -3060,7 +3393,8 @@ def page_quality(text: str) -> tuple[float, float, int]:
 
 def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
                   check_quality: bool = True,
-                  needles: set[str] | None = None) -> dict:
+                  needles: set[str] | None = None,
+                  exact: set[str] | None = None) -> dict:
     """
     Verify an output PDF.
 
@@ -3072,6 +3406,10 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
     needles = needles or set(DEFAULT_WATERMARK_NEEDLES)
     pat = re.compile("(" + "|".join(re.escape(x) for x in sorted(
         needles, key=len, reverse=True)) + ")", re.IGNORECASE)
+    # detected stamp strings removed by whole-line EQUALITY: a surviving
+    # line exactly equal to one is residual watermark; text that merely
+    # CONTAINS the same words (titles, prose) must not fail the check
+    exact = {e for e in (exact or set()) if len(e) >= 3}
     try:
         from pypdf import PdfReader
         total = len(PdfReader(str(pdf_path)).pages)
@@ -3089,7 +3427,14 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
         seen_any = True
         text = extract_text_page(pdf_path, pno)
         read, garb, words = page_quality(text)
-        wm = len(pat.findall(text))
+        # only STAMP-SIZED lines count (see MAX_STAMP_PAYLOAD): a long
+        # copyright sentence containing a DEFAULT phrase like
+        # 'may not be copied' is legitimate prose, not residual watermark
+        wm = sum(len(pat.findall(ln)) for ln in text.splitlines()
+                 if len(_norm_text(ln)) <= MAX_STAMP_PAYLOAD)
+        if exact and text:
+            wm += sum(1 for ln in text.splitlines()
+                      if _exact_key(ln) in exact)
         watermark_hits += wm
         bad = (check_quality and (garb > 0.05 or read < 0.55 or words < 5))
         if bad:
@@ -3121,7 +3466,11 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
     if not full:
         full = " ".join(extract_text_page(pdf_path, p) for p in sample_pages
                         if p <= total)
-    full_hits = len(pat.findall(full or ""))
+    full_hits = sum(len(pat.findall(ln)) for ln in (full or "").splitlines()
+                    if len(_norm_text(ln)) <= MAX_STAMP_PAYLOAD)
+    if exact and full:
+        full_hits += sum(1 for ln in full.splitlines()
+                         if _exact_key(ln) in exact)
 
     ok = (seen_any and watermark_hits == 0 and full_hits == 0
           and (bad_samples == 0 or not check_quality))
@@ -3345,7 +3694,8 @@ def main(argv=None) -> int:
         shutil.copyfile(step1, out)
         size_after = out.stat().st_size
         res = verify_output(out, sample_pages, "none (no OCR)", "final",
-                            check_quality=False, needles=an.text_needles)
+                            check_quality=False, needles=an.text_needles,
+                            exact=an.text_exact)
 
         # hidden-watermark residue check: invisible text is NOT in the
         # extracted text layer, so verify_output cannot see it - scan the
@@ -3425,7 +3775,8 @@ def main(argv=None) -> int:
     # --------------------------------------------------------------- step 3
     size_after = out.stat().st_size
     res = verify_output(out, sample_pages, language, "final",
-                        check_quality=True, needles=an.text_needles)
+                        check_quality=True, needles=an.text_needles,
+                        exact=an.text_exact)
 
     if not args.keep_intermediate:
         step1.unlink(missing_ok=True)
