@@ -773,6 +773,51 @@ def _form_stream_uses(doc, xref, cache, data=None):
     return uses
 
 
+def _form_struct_key(stream: bytes) -> bytes:
+    """Structural signature of a form stream: operator sequence with operand
+    KINDS but not values, and marked-content wrappers (BMC/BDC/EMC) dropped.
+    Merged-PDF writers (iLovePDF) emit the same stamp form per chapter with
+    different coordinates and/or an extra /Artifact BDC..EMC wrapper; raw
+    digest grouping splits the family below the 90% threshold and the stamp
+    survives.  Signature grouping keeps them one family."""
+    try:
+        ops = parse_operators(tokenize(stream))
+    except Exception:
+        s = re.sub(rb"[-\d.]+", b"N", stream)
+        s = re.sub(rb"/Artifact\s*<<.*?>>\s*BDC", b"MC", s, flags=re.S)
+        s = re.sub(rb"\bBMC\b|\bEMC\b", b"MC", s)
+        return __import__("hashlib").sha256(s).digest()
+    parts = []
+    for operands, op in ops:
+        name = op[1] if isinstance(op, tuple) else op
+        if name in (b"BMC", b"BDC", b"EMC"):
+            continue
+        shape = "".join(t[0][:2] for t in operands)
+        parts.append(name.decode("latin-1", "replace") + "(" + shape + ")")
+    return __import__("hashlib").sha256(
+        ",".join(parts).encode("latin-1", "replace")).digest()
+
+
+def _form_looks_translucent(doc, xref) -> bool:
+    """True when a form paints with reduced opacity: its own ExtGStates
+    carry ca/CA below 0.85, or it declares a transparency /Group (soft-mask
+    blend stamps are written this way).  Content frames (photos, figures)
+    are opaque and protected by this test."""
+    try:
+        if (doc.xref_get_key(xref, "Group")[0] or "null") != "null":
+            return True
+    except Exception:
+        pass
+    try:
+        for ca, CA in _extgstate_alphas(doc, xref).values():
+            for v in (ca, CA):
+                if v is not None and v < 0.85:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def _form_drawn_rects(doc, page, cache):
     """Every Form XObject drawn on `page` (directly or through nesting) as
     (form_xref, Rect in fitz page space).
@@ -1482,6 +1527,7 @@ class WatermarkGroup:
         self.rects: list[tuple] = []       # normalized bbox per page
         self.rotated_draws = 0             # draws with a rotated CTM
         self.template = False              # form carries text/>=2 XObjects
+        self.translucent = False           # form paints with alpha/Group
         self.width = width
         self.height = height
 
@@ -1685,6 +1731,11 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     form_stats: dict[bytes, tuple] = {}   # digest -> (has_text, n_do)
     form_ctm_cache: dict[int, list] = {}  # xref -> [(child_name, ctm)]
     text_by_key: dict[tuple, TextGroup] = {}
+    # position-INDEPENDENT stamp pool: text repeated on ~every page at
+    # whatever place - needed because mixed page sizes (e.g. 612x792 mixed
+    # with 672x852 in one book) split position-keyed groups below the 90%
+    # threshold, hiding the doc-wide stamp from the form-correlation rule
+    stamp_pool: dict[tuple, tuple] = {}
     # (pages, per-page bbox, sample text, area, rotated)
     pos_by_key: dict[tuple, tuple] = {}
     # hidden (Tr 3 / low alpha) text payloads: page -> {normalized text: [chunks]}
@@ -1769,7 +1820,7 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             if not stream:
                 continue
             fdigest = __import__("hashlib").sha256(stream).digest()
-            fkey = b"form:" + fdigest
+            fkey = b"form:" + _form_struct_key(stream)
             stats = form_stats.get(fdigest)
             if stats is None:
                 has_text = (b"BT" in stream and (b"Tj" in stream
@@ -1787,9 +1838,12 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
             hr = (ty1 - ty0) / ph
             ratio = min(wr, hr)
             fg = WatermarkGroup(fkey, fx, int(tx1 - tx0), int(ty1 - ty0))
-            fg.template = stats[0] or stats[1] >= 2
             _group_add(form_by_digest, fkey, fg, pno, ratio, wr * hr,
                        (tx0 / pw, ty0 / ph, wr, hr))
+            grp = form_by_digest[fkey]
+            grp.template = grp.template or bool(stats[0] or stats[1] >= 2)
+            grp.translucent = grp.translucent or _form_looks_translucent(
+                doc, fx)
 
         # ---- inline images ----------------------------------------------
         try:
@@ -1980,6 +2034,22 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
                          round(bbox.y0 / ph * 100),
                          round(bbox.width / pw * 100),
                          round(bbox.height / ph * 100))
+                    # position-independent pool (txt, rotated) -> pages +
+                    # union rect in normalized page space
+                    pk = (txt, bool(rotated))
+                    pr = stamp_pool.get(pk)
+                    if pr is None:
+                        stamp_pool[pk] = ({pno}, [bbox.x0 / pw,
+                                                  bbox.y0 / ph,
+                                                  bbox.x1 / pw,
+                                                  bbox.y1 / ph])
+                    else:
+                        pr[0].add(pno)
+                        r0 = pr[1]
+                        r0[:] = [min(r0[0], bbox.x0 / pw),
+                                 min(r0[1], bbox.y0 / ph),
+                                 max(r0[2], bbox.x1 / pw),
+                                 max(r0[3], bbox.y1 / ph)]
                     key = (txt, bool(rotated), q)
                     tg = text_by_key.get(key)
                     if tg is None:
@@ -2256,6 +2326,21 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
     #    inside a legitimate template form) -> its Do call is removed from
     #    its callers, not the template itself.
     stamp_rects = [g.rect for g in an.text_candidate_groups]
+    hidden_txts = set(an.hidden_needles)
+    for (txt_p, rot_p), (pages_p, rect_u) in stamp_pool.items():
+        # stamp-flavoured families: rotated (diagonal), a known watermark
+        # string, or a member of the hidden/translucent family (e.g. a
+        # near-horizontal low-alpha handle repeated on every page); must be
+        # repeated on >=90% of pages at any position
+        if not (rot_p or any(n in txt_p for n in known)
+                or txt_p in hidden_txts):
+            continue
+        if len(pages_p) / max(1, an.total_pages) < TEXT_MIN_PAGES:
+            continue
+        rx = (rect_u[2] - rect_u[0], rect_u[3] - rect_u[1])
+        if rx[0] <= 0 or rx[1] <= 0:
+            continue
+        stamp_rects.append((rect_u[0], rect_u[1], rx[0], rx[1]))
     for g in an.form_groups:
         freq = len(g.pages) / max(1, an.total_pages)
         if freq < WATERMARK_FREQ_MIN or g.template:
@@ -2263,20 +2348,66 @@ def analyze_watermarks(doc, pages) -> WatermarkAnalysis:
         if cover_of(g) >= WATERMARK_COVER_MIN:
             an.form_candidate_groups.append(g)
             continue
-        if not (0.05 <= g.area_of() <= 0.85) or not g.same_rect():
+        if (not (0.05 <= g.area_of() <= 0.85) or len(g.rects) < 2
+                or not g.translucent):
+            # stamps are translucent art; an opaque small form at the same
+            # place is more likely content (photo frame) than watermark
             continue
-        fx0, fy0, fw, fh = g.rects[0]
-        fa = fw * fh
-        if fa <= 0:
-            continue
-        for (sx0, sy0, sw, sh) in stamp_rects:
-            ix = max(0.0, min(fx0 + fw, sx0 + sw) - max(fx0, sx0))
-            iy = max(0.0, min(fy0 + fh, sy0 + sh) - max(fy0, sy0))
-            if ix * iy / fa >= 0.5:
-                an.form_candidate_groups.append(g)
-                break
+        # per-page correlation with the detected stamp families: the form
+        # may drift with mixed page sizes (merged books), so test EVERY use
+        # against the stamp union rects - >=90% of draws must overlap a
+        # stamp region by >=50% of the form's own area
+        hit = 0
+        n_ok = 0
+        for (fx0, fy0, fw, fh) in g.rects:
+            fa = fw * fh
+            if fa <= 0:
+                continue
+            n_ok += 1
+            for (sx0, sy0, sw, sh) in stamp_rects:
+                ix = max(0.0, min(fx0 + fw, sx0 + sw) - max(fx0, sx0))
+                iy = max(0.0, min(fy0 + fh, sy0 + sh) - max(fy0, sy0))
+                if ix * iy / fa >= 0.5:
+                    hit += 1
+                    break
+        if n_ok and hit / n_ok >= 0.9 and stamp_rects:
+            an.form_candidate_groups.append(g)
     for g in an.form_candidate_groups:
         an.form_candidates |= g.xrefs
+
+    # ---- correlated stamp IMAGES (merged-book chapter variant) ----------
+    # Some writers draw the stamp bitmap directly in the page stream instead
+    # of through a nested form, at an area just below the 25% same-position
+    # banner rule.  Accept such an image family ONLY when EVERY draw of it
+    # anywhere in the document overlaps a detected stamp-text region by >=50%
+    # of its area and there are >=3 draws - so a one-off content photo is
+    # never touched and an image that also serves legitimately elsewhere
+    # (shared logos/footers) fails the test and is left alone.  The stamp
+    # pool entry is the union of the watermark-text placements, which by
+    # construction sit on >=90% of all pages.
+    if stamp_rects:
+        for g in an.groups:
+            if not (0.05 <= g.area_of() <= 0.85) or len(g.rects) < 3:
+                continue
+            ok = True
+            for (fx0, fy0, fw, fh) in g.rects:
+                fa = fw * fh
+                if fa <= 0:
+                    ok = False
+                    break
+                if not any(
+                        max(0.0, min(fx0 + fw, sx0 + sw) - max(fx0, sx0)) *
+                        max(0.0, min(fy0 + fh, sy0 + sh) - max(fy0, sy0)) /
+                        fa >= 0.5
+                        for (sx0, sy0, sw, sh) in stamp_rects):
+                    ok = False
+                    break
+            if ok:
+                an.candidates.extend(sorted(g.xrefs))
+                an.report.append(
+                    f"image xref(s) {sorted(g.xrefs)} drawn ONLY at the "
+                    f"watermark-stamp region ({len(g.pages)} pages) -> "
+                    "removed as stamp artwork")
 
     # ---- repeated VECTOR path family ---------------------------------------
     # Identical path geometry (user-space operands) repeated on >=90% of
@@ -3415,6 +3546,15 @@ def verify_output(pdf_path: Path, sample_pages, language: str, tag: str,
         total = len(PdfReader(str(pdf_path)).pages)
     except Exception:
         total = 0
+    if total <= 0:
+        # pypdf can mis-parse some writer outputs (e.g. iLovePDF linearized
+        # books report 0 pages); MuPDF is the reference reader here
+        try:
+            _d = fitz.open(pdf_path)
+            total = _d.page_count
+            _d.close()
+        except Exception:
+            total = 0
     print(f"[verify] {tag}: {total} pages; sampling {sample_pages}")
 
     watermark_hits = 0
